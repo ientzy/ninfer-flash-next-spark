@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Clone ninfer and apply the series
         run: NINFER_DIR="$RUNNER_TEMP/ninfer" scripts/setup.sh --no-build
-      - name: Whitespace check on the result
+      - name: Show the applied series
         run: git -C "$RUNNER_TEMP/ninfer" log --oneline -9
 
   lint:

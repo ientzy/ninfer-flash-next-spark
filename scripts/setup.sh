@@ -30,9 +30,10 @@ if git rev-parse -q --verify refs/heads/flash-next-spark >/dev/null; then
 else
     git fetch -q origin "$PIN" 2>/dev/null || git fetch -q origin
     git checkout -q -b flash-next-spark "$PIN"
+    patches=("$ROOT"/patches/*.patch)
     git -c user.name="${GIT_AUTHOR_NAME:-setup}" -c user.email="${GIT_AUTHOR_EMAIL:-setup@localhost}" \
-        am -q "$ROOT"/patches/*.patch
-    echo "applied $(ls "$ROOT"/patches/*.patch | wc -l) patches on ${PIN:0:7}"
+        am -q "${patches[@]}"
+    echo "applied ${#patches[@]} patches on ${PIN:0:7}"
 fi
 
 [ "${1:-}" = --no-build ] && exit 0
