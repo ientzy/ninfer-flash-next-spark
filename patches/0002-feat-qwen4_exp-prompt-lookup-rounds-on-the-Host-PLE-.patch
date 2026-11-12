@@ -1,0 +1,267 @@
+From 8bff04daa5bbf9ba60e9d4d37e360815feaf3e1d Mon Sep 17 00:00:00 2001
+From: ientzy <ientzy@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 13:14:29 +0200
+Subject: [PATCH 2/9] feat(qwen4_exp): prompt-lookup rounds on the Host PLE
+ decode path
+
+A round whose newest tokens repeat an earlier stretch of the sequence verifies the tokens that
+followed it instead of MTP proposals, running one MTP step. NINFER_PROMPT_LOOKUP=<match length>
+enables it for single-lane decode.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/models/qwen4_exp/program/mtp.cpp       | 36 +++++++++++--
+ src/models/qwen4_exp/session/execution.cpp | 60 +++++++++++++++++++++-
+ src/models/qwen4_exp/session/internal.h    |  5 ++
+ src/models/qwen4_exp/wire.cpp              | 10 +++-
+ src/models/qwen4_exp/work.cpp              |  9 ++++
+ src/models/qwen4_exp/work.h                |  3 ++
+ 6 files changed, 116 insertions(+), 7 deletions(-)
+
+diff --git a/src/models/qwen4_exp/program/mtp.cpp b/src/models/qwen4_exp/program/mtp.cpp
+index 537fd71..429c593 100644
+--- a/src/models/qwen4_exp/program/mtp.cpp
++++ b/src/models/qwen4_exp/program/mtp.cpp
+@@ -223,15 +223,26 @@ void RankProgramImpl::prepare_mtp() {
+     const auto& frame   = *buffers.mtp;
+     const auto batch    = static_cast<std::int32_t>(f.rows.size());
+     const auto k = shape.draft_tokens, width = k + 1;
++    const bool lookup = !work.lookup.empty();
+     std::array<ple::InputRow, kMaximumConcurrency> inputs;
++    // A lookup round knows every verify token up front, so its PLE window is requested whole.
++    std::array<std::vector<TokenId>, kMaximumConcurrency> known;
+     for (int b = 0; b < batch; ++b) {
+         const auto& row = f.rows[b];
+         inputs[b] = {{row.member.sequence.value, row.member.sequence.generation, row.main_frontier,
+                       row.ple_raw_tail},
+                      row.ids};
++        if (lookup) {
++            known[b] = row.ids;
++            known[b].insert(known[b].end(), work.lookup[b].begin(), work.lookup[b].end());
++            inputs[b].ids = known[b];
++        }
+     }
+     if (host_ple) {
+-        f.ple = host_ple->try_begin(f.request.ticket, width, {inputs.data(), f.rows.size()});
++        f.ple = lookup ? host_ple->try_require(f.request.ticket, width,
++                                               {inputs.data(), f.rows.size()})
++                       : host_ple->try_begin(f.request.ticket, width,
++                                             {inputs.data(), f.rows.size()});
+         if (!f.ple) return;
+     }
+     f.verify.emplace();
+@@ -260,14 +271,31 @@ void RankProgramImpl::prepare_mtp() {
+         f.draft_visible.push_back(calls.back().max_visible_tokens);
+     }
+     if (device_graphs) {
++        if (lookup) throw std::logic_error("prompt lookup needs the Host PLE decode path");
+         prepare_main();
+         return;
+     }
+-    if (!graphs) install_decode(batch);
++    if (!graphs || lookup) install_decode(batch);
+     gpu_timer.begin_draft();
+     {
+         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp);
+-        if (graphs && host_ple)
++        if (lookup) {
++            // Step 0 still runs: the commit takes the MTP tail it leaves in working slot 0.
++            draft_forward(0, batch, calls[0].max_visible_tokens);
++            for (std::uint32_t step = 0; step < steps; ++step) {
++                auto ids = draft_output_ids(step, batch);
++                std::array<std::int32_t, kMaximumConcurrency> values{};
++                for (int b = 0; b < batch; ++b)
++                    values[b] = step < work.lookup[b].size()
++                                    ? work.lookup[b][step]
++                                    : parameters.profile->config.text.ple.eos;
++                copy_bytes({ids.data, ids.bytes(), cuda.device()},
++                           {values.data(), static_cast<std::size_t>(batch) * sizeof(std::int32_t),
++                            Device::cpu()},
++                           cuda);
++            }
++            if (host_ple) host_ple->progress();
++        } else if (graphs && host_ple)
+             graphs->draft(batch, calls, *f.ple, round.extents);
+         else {
+             for (std::uint32_t step = 0; step < steps; ++step) {
+@@ -283,7 +311,7 @@ void RankProgramImpl::prepare_mtp() {
+     std::array<std::uint32_t, kMaximumConcurrency> valid;
+     gpu_timer.end_draft();
+     for (int b = 0; b < batch; ++b) valid[b] = round.extents[b] + 1;
+-    if (host_ple) host_ple->seal(*f.ple, {valid.data(), f.rows.size()});
++    if (host_ple && !lookup) host_ple->seal(*f.ple, {valid.data(), f.rows.size()});
+     ops::prepare_verify_ids(row_tensor(buffers.anchors), drafts, row_tensor(frame.extents),
+                             f.batch.ids, cuda);
+     if (!host_ple) {
+diff --git a/src/models/qwen4_exp/session/execution.cpp b/src/models/qwen4_exp/session/execution.cpp
+index 68ef26c..ebafbb4 100644
+--- a/src/models/qwen4_exp/session/execution.cpp
++++ b/src/models/qwen4_exp/session/execution.cpp
+@@ -1,11 +1,49 @@
+ #include "models/qwen4_exp/session/internal.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ 
+ namespace ninfer::models::qwen4_exp {
+ namespace {
+ using Kind = detail::ComputeTransaction::Kind;
+ 
++// Prompt lookup (ported idea from Cinference's DFlash2 lookup rounds): when the newest tokens repeat
++// an earlier stretch of the sequence, the tokens that followed it are verified as the drafts.
++// NINFER_PROMPT_LOOKUP=<suffix length, at least 2> enables it; unset or 0 keeps every round on MTP.
++std::uint32_t lookup_suffix() {
++    static const std::uint32_t value = [] {
++        const char* text = std::getenv("NINFER_PROMPT_LOOKUP");
++        const auto n     = text ? std::strtoul(text, nullptr, 10) : 0UL;
++        return n >= 2 && n <= 64 ? static_cast<std::uint32_t>(n) : 0U;
++    }();
++    return value;
++}
++
++// The `want` tokens that followed the earlier occurrence sharing the longest run of tokens with the
++// end of the sequence (at least `suffix`; the latest one among equals). Empty when there is none or
++// fewer than `want` tokens follow it.
++std::vector<TokenId> lookup_chain(std::span<const TokenId> tokens, std::uint32_t want,
++                                  std::uint32_t suffix) {
++    constexpr std::size_t kLongest = 48;
++    const auto n = tokens.size();
++    if (!want || !suffix || n < suffix + want + 1) return {};
++    const auto* tail = tokens.data() + n - suffix;
++    std::size_t best = 0, best_end = 0;
++    for (std::size_t end = n - want; end >= suffix; --end) {
++        if (tokens[end - 1] != tokens[n - 1]) continue;
++        if (!std::equal(tail, tail + suffix, tokens.data() + end - suffix)) continue;
++        std::size_t run = suffix;
++        while (run < kLongest && run < end && tokens[end - 1 - run] == tokens[n - 1 - run]) ++run;
++        if (run > best) {
++            best     = run;
++            best_end = end;
++            if (run == kLongest) break;
++        }
++    }
++    if (!best) return {};
++    return {tokens.begin() + best_end, tokens.begin() + best_end + want};
++}
++
+ void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservation, Work work) {
+     auto& tx = *session.compute;
+     tx.context.prepare_actions();
+@@ -120,6 +158,26 @@ Session::start_decode(std::span<const SequenceHandle> members,
+                                p.shape.max_context - f - 1});
+         speculative |= extents[b] != 0;
+     }
++    // One lane only: a lookup round replaces the whole batch's MTP chain.
++    std::vector<std::vector<TokenId>> lookup;
++    if (speculative && members.size() == 1 && lookup_suffix() && extents[0] >= 2) {
++        auto& s = p.sequence(members[0]);
++        if (s.lookup_last) {
++            const auto drafted  = s.speculative.drafted_tokens - s.lookup_drafted;
++            const auto accepted = s.speculative.accepted_tokens - s.lookup_accepted;
++            if (accepted * 2 < drafted) s.lookup_cooldown = 3;
++            s.lookup_last = false;
++        }
++        if (s.lookup_cooldown)
++            --s.lookup_cooldown;
++        else if (auto chain = lookup_chain(s.identity.tokens, extents[0], lookup_suffix());
++                 !chain.empty()) {
++            lookup.push_back(std::move(chain));
++            s.lookup_last     = true;
++            s.lookup_drafted  = s.speculative.drafted_tokens;
++            s.lookup_accepted = s.speculative.accepted_tokens;
++        }
++    }
+     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
+     if (!reservation) return {};
+     p.compute = std::make_unique<detail::ComputeTransaction>(
+@@ -140,7 +198,7 @@ Session::start_decode(std::span<const SequenceHandle> members,
+         }
+         Work work;
+         if (speculative)
+-            work.operation = MtpWork{tx.rows, tx.extents};
++            work.operation = MtpWork{tx.rows, tx.extents, std::move(lookup)};
+         else
+             work.operation = ForwardWork{ForwardKind::Ordinary, SampleKind::NextToken, tx.rows, {}};
+         submit(p, std::move(*reservation), std::move(work));
+diff --git a/src/models/qwen4_exp/session/internal.h b/src/models/qwen4_exp/session/internal.h
+index 58ece5f..b262942 100644
+--- a/src/models/qwen4_exp/session/internal.h
++++ b/src/models/qwen4_exp/session/internal.h
+@@ -96,6 +96,11 @@ struct Sequence {
+     std::unique_ptr<CaptureReservation> capture;
+     bool capture_pending = false;
+     SpeculativeStats speculative;
++    // Prompt lookup: draft counters seen when the last lookup round was submitted, and the number
++    // of rounds to stay on MTP after a lookup round kept under half of its drafts.
++    std::uint64_t lookup_drafted = 0, lookup_accepted = 0;
++    std::uint32_t lookup_cooldown = 0;
++    bool lookup_last              = false;
+ };
+ 
+ struct Suspended {
+diff --git a/src/models/qwen4_exp/wire.cpp b/src/models/qwen4_exp/wire.cpp
+index b0c524c..63717f5 100644
+--- a/src/models/qwen4_exp/wire.cpp
++++ b/src/models/qwen4_exp/wire.cpp
+@@ -185,6 +185,8 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
+                 out.u8(2);
+                 rows(out, v.rows, rank);
+                 integers(out, v.draft_extents);
++                out.u64(v.lookup.size());
++                for (const auto& row : v.lookup) integers(out, row);
+             } else if constexpr (std::is_same_v<T, ContextWork>) {
+                 out.u8(3);
+                 out.u64(v.bindings.size());
+@@ -229,9 +231,13 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
+         work.operation = std::move(v);
+         break;
+     }
+-    case 2:
+-        work.operation = MtpWork{rows(in, rank), integers<std::uint32_t>(in)};
++    case 2: {
++        MtpWork v{rows(in, rank), integers<std::uint32_t>(in), {}};
++        v.lookup.resize(in.u64());
++        for (auto& row : v.lookup) row = integers<TokenId>(in);
++        work.operation = std::move(v);
+         break;
++    }
+     case 3: {
+         ContextWork v;
+         v.bindings.resize(in.count(68));
+diff --git a/src/models/qwen4_exp/work.cpp b/src/models/qwen4_exp/work.cpp
+index 347a399..385124e 100644
+--- a/src/models/qwen4_exp/work.cpp
++++ b/src/models/qwen4_exp/work.cpp
+@@ -225,6 +225,15 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
+                     any |= extent != 0;
+                 }
+                 if (!any) throw std::invalid_argument("Qwen4Exp MTP work has no draft positions");
++                if (!operation.lookup.empty()) {
++                    if (operation.lookup.size() != rows.size())
++                        throw std::invalid_argument("invalid Qwen4Exp prompt-lookup rows");
++                    for (std::size_t i = 0; i < rows.size(); ++i) {
++                        if (operation.lookup[i].size() != operation.draft_extents[i])
++                            throw std::invalid_argument("invalid Qwen4Exp prompt-lookup extent");
++                        tokens(operation.lookup[i], public_tokens);
++                    }
++                }
+             } else if constexpr (std::is_same_v<T, ScoreWork>) {
+                 if (shape.purpose != EnginePurpose::CausalScoring || operation.row.ids.empty() ||
+                     operation.row.ids.size() > shape.prefill_chunk ||
+diff --git a/src/models/qwen4_exp/work.h b/src/models/qwen4_exp/work.h
+index 8035304..83c3407 100644
+--- a/src/models/qwen4_exp/work.h
++++ b/src/models/qwen4_exp/work.h
+@@ -69,6 +69,9 @@ struct ForwardWork {
+ struct MtpWork {
+     std::vector<WorkRow> rows;
+     std::vector<std::uint32_t> draft_extents;
++    // Prompt lookup: empty, or one row per member holding exactly draft_extents[row] tokens copied
++    // from the sequence's own history. A lookup round verifies these instead of MTP proposals.
++    std::vector<std::vector<TokenId>> lookup;
+ };
+ 
+ struct ResidencyBinding {
+-- 
+2.43.0
+

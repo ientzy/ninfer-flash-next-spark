@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 420" width="880" height="420" role="img" aria-label="Decode speed in tokens per second by kind of text, one stream, greedy, on a DGX Spark">
+<rect width="880" height="420" rx="10" fill="#1a1a19"/>
+<text x="56" y="30" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="16" font-weight="600" fill="#f0efec">Qwen3.8 Flash Next on a DGX Spark: decode speed, one stream</text>
+<text x="56" y="50" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">tokens per second, greedy, 384 tokens, engine alone on the machine</text>
+<rect x="56" y="62" width="10" height="10" rx="2" fill="#3987e5"/>
+<text x="72" y="71" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">This build</text>
+<rect x="160.0" y="62" width="10" height="10" rx="2" fill="#d95926"/>
+<text x="176.0" y="71" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">Stock ninfer (MTP, 3 drafts)</text>
+<line x1="56" x2="856" y1="372.0" y2="372.0" stroke="#383835" stroke-width="1"/>
+<text x="48" y="376.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#c3c2b7">0</text>
+<line x1="56" x2="856" y1="300.0" y2="300.0" stroke="#383835" stroke-width="1"/>
+<text x="48" y="304.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#c3c2b7">40</text>
+<line x1="56" x2="856" y1="228.0" y2="228.0" stroke="#383835" stroke-width="1"/>
+<text x="48" y="232.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#c3c2b7">80</text>
+<line x1="56" x2="856" y1="156.0" y2="156.0" stroke="#383835" stroke-width="1"/>
+<text x="48" y="160.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#c3c2b7">120</text>
+<line x1="56" x2="856" y1="84.0" y2="84.0" stroke="#383835" stroke-width="1"/>
+<text x="48" y="88.0" text-anchor="end" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" fill="#c3c2b7">160</text>
+<path d="M81.7,372.0 V299.9 Q81.7,295.9 85.7,295.9 H117.7 Q121.7,295.9 121.7,299.9 V372.0 Z" fill="#3987e5"/>
+<text x="101.7" y="289.9" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" font-weight="600" fill="#f0efec">42</text>
+<path d="M123.7,372.0 V305.3 Q123.7,301.3 127.7,301.3 H159.7 Q163.7,301.3 163.7,305.3 V372.0 Z" fill="#d95926"/>
+<text x="122.7" y="392" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">Story</text>
+<path d="M215.0,372.0 V265.1 Q215.0,261.1 219.0,261.1 H251.0 Q255.0,261.1 255.0,265.1 V372.0 Z" fill="#3987e5"/>
+<text x="235.0" y="255.1" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" font-weight="600" fill="#f0efec">62</text>
+<path d="M257.0,372.0 V287.6 Q257.0,283.6 261.0,283.6 H293.0 Q297.0,283.6 297.0,287.6 V372.0 Z" fill="#d95926"/>
+<text x="256.0" y="392" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">Explanation</text>
+<path d="M348.3,372.0 V229.7 Q348.3,225.7 352.3,225.7 H384.3 Q388.3,225.7 388.3,229.7 V372.0 Z" fill="#3987e5"/>
+<text x="368.3" y="219.7" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" font-weight="600" fill="#f0efec">81</text>
+<path d="M390.3,372.0 V273.6 Q390.3,269.6 394.3,269.6 H426.3 Q430.3,269.6 430.3,273.6 V372.0 Z" fill="#d95926"/>
+<text x="389.3" y="392" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">New code</text>
+<path d="M481.7,372.0 V209.0 Q481.7,205.0 485.7,205.0 H517.7 Q521.7,205.0 521.7,209.0 V372.0 Z" fill="#3987e5"/>
+<text x="501.7" y="199.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" font-weight="600" fill="#f0efec">93</text>
+<path d="M523.7,372.0 V268.9 Q523.7,264.9 527.7,264.9 H559.7 Q563.7,264.9 563.7,268.9 V372.0 Z" fill="#d95926"/>
+<text x="522.7" y="392" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">Thinking</text>
+<path d="M615.0,372.0 V159.5 Q615.0,155.5 619.0,155.5 H651.0 Q655.0,155.5 655.0,159.5 V372.0 Z" fill="#3987e5"/>
+<text x="635.0" y="149.5" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" font-weight="600" fill="#f0efec">120</text>
+<path d="M657.0,372.0 V259.5 Q657.0,255.5 661.0,255.5 H693.0 Q697.0,255.5 697.0,259.5 V372.0 Z" fill="#d95926"/>
+<text x="656.0" y="392" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">JSON</text>
+<path d="M748.3,372.0 V92.0 Q748.3,88.0 752.3,88.0 H784.3 Q788.3,88.0 788.3,92.0 V372.0 Z" fill="#3987e5"/>
+<text x="768.3" y="82.0" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11" font-weight="600" fill="#f0efec">158</text>
+<path d="M790.3,372.0 V261.7 Q790.3,257.7 794.3,257.7 H826.3 Q830.3,257.7 830.3,261.7 V372.0 Z" fill="#d95926"/>
+<text x="789.3" y="392" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" fill="#c3c2b7">File edit</text>
+</svg>

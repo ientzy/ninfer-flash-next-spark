@@ -1,0 +1,6 @@
+/ninfer/
+/models/
+/config/local.toml
+/bench/runs/
+__pycache__/
+*.log

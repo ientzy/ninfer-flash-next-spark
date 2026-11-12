@@ -1,0 +1,476 @@
+From 5a24c1145eceedd27223375360924d45c93d7f35 Mon Sep 17 00:00:00 2001
+From: ientzy <ientzy@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:22:57 +0200
+Subject: [PATCH 5/9] Flash Next DFlash2: automatic draft width
+
+Each round verifies only as many drafts as the selector's confidence says pay off:
+the extent maximizes expected kept tokens per column of round cost. One-row verify
+forwards run on per-width CUDA graphs and record a prefix of the GDN replay window.
+NINFER_FLASH_DFLASH2_AUTO=<round cost in columns> turns it on (0 = fixed width),
+NINFER_FLASH_DFLASH2_AUTO_POWER sharpens the confidence (2 is calibrated on the Spark).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ include/ninfer/ops/flash_dflash.h          |  8 ++++
+ src/models/qwen4_exp/execution/dflash.cpp  |  3 ++
+ src/models/qwen4_exp/execution/dflash.h    |  1 +
+ src/models/qwen4_exp/execution/gdn.cpp     | 13 +++++-
+ src/models/qwen4_exp/program/dflash.cpp    | 39 +++++++++++++++-
+ src/models/qwen4_exp/program/dflash.h      |  8 ++++
+ src/models/qwen4_exp/program/execution.cpp |  3 +-
+ src/models/qwen4_exp/program/graphs.cpp    | 20 ++++++--
+ src/models/qwen4_exp/program/graphs.h      |  7 ++-
+ src/models/qwen4_exp/program/internal.h    |  1 +
+ src/models/qwen4_exp/program/mtp.cpp       | 18 ++++++--
+ src/models/qwen4_exp/program/program.cpp   | 15 ++++--
+ src/ops/flash_dflash/flash_dflash.cu       | 54 ++++++++++++++++++++++
+ 13 files changed, 173 insertions(+), 17 deletions(-)
+
+diff --git a/include/ninfer/ops/flash_dflash.h b/include/ninfer/ops/flash_dflash.h
+index 703c5cf..782e649 100644
+--- a/include/ninfer/ops/flash_dflash.h
++++ b/include/ninfer/ops/flash_dflash.h
+@@ -67,6 +67,14 @@ void context_kv_store(const Tensor& packed, const Tensor& positions, const Tenso
+ // out[r,m] = BF16(SiLU(gate_up[r,m]) * gate_up[I+r,m]); gate_up is BF16 [2*I, M], out [I, M].
+ void swiglu_packed(const Tensor& gate_up, Tensor& out, CudaExecutionView execution);
+ 
++// One row. out[i] is the candidate selector's temperature-1 probability of drafts[i] among its 16
++// candidates, given the chosen predecessor (the anchor for i = 0): the softmax of the edge scores
++// of candidate_selector.h. candidates I32 [16,K], scores FP32 [16,K], projected BF16 [256,K],
++// codebooks BF16 [256,V], drafts I32 [K], out FP32 [K].
++void selector_confidence(const Tensor& candidates, const Tensor& scores, const Tensor& projected,
++                         const Tensor& anchors, const Tensor& predecessor, const Tensor& successor,
++                         const Tensor& drafts, Tensor& out, CudaExecutionView execution);
++
+ // The 16 largest of the first `valid` rows of each column of BF16 logits [V,M], descending, ties
+ // to the lower row. ids is I32 [16,M], scores FP32 [16,M] (the logits' values).
+ void logits_top16(const Tensor& logits, std::int32_t valid, std::int32_t columns, Tensor& ids,
+diff --git a/src/models/qwen4_exp/execution/dflash.cpp b/src/models/qwen4_exp/execution/dflash.cpp
+index 76efa9a..c73e35c 100644
+--- a/src/models/qwen4_exp/execution/dflash.cpp
++++ b/src/models/qwen4_exp/execution/dflash.cpp
+@@ -164,6 +164,9 @@ void draft_propose(const Parameters& parameters, MemoryArena& arena, const Draft
+                                  call.anchors, p.predecessor_codebook, p.successor_codebook,
+                                  dimension(profile.public_tokens), call.frontiers, call.sampling,
+                                  drafts, law, arena, cuda);
++    auto confidence = call.confidence;
++    ops::selector_confidence(candidates, scores, projected, call.anchors, p.predecessor_codebook,
++                             p.successor_codebook, call.drafts.view({k}), confidence, cuda);
+ }
+ 
+ } // namespace ninfer::models::qwen4_exp::execution
+diff --git a/src/models/qwen4_exp/execution/dflash.h b/src/models/qwen4_exp/execution/dflash.h
+index d2e8af1..28f3bc9 100644
+--- a/src/models/qwen4_exp/execution/dflash.h
++++ b/src/models/qwen4_exp/execution/dflash.h
+@@ -34,6 +34,7 @@ struct DraftProposal {
+     Tensor candidates;                         // I32 [16,K,1]
+     Tensor scores, proposal_q;                 // FP32 [16,K,1]
+     Tensor drafts;                             // I32 [K,1]
++    Tensor confidence;                         // FP32 [K]: selector probability of each draft
+     std::uint32_t max_context = 0;
+ };
+ 
+diff --git a/src/models/qwen4_exp/execution/gdn.cpp b/src/models/qwen4_exp/execution/gdn.cpp
+index 4e2f51a..2f639f7 100644
+--- a/src/models/qwen4_exp/execution/gdn.cpp
++++ b/src/models/qwen4_exp/execution/gdn.cpp
+@@ -46,8 +46,17 @@ void gdn(const Tensor& input, const GdnConfig& c, const GdnParameters& p, const
+                              final, recurrent, cuda);
+     } else if (const auto* record = std::get_if<VerifyRecords>(&update)) {
+         auto state         = states.layer_view(layer, batch.source_offsets);
+-        const auto records = record->gdn.layer(layer, batch.batch);
+-        const auto t       = batch.tokens;
++        auto records = record->gdn.layer(layer, batch.batch);
++        const auto t = batch.tokens;
++        if (t < records.conv.ne[1]) {
++            // A one-row verify forward narrower than the planned window records a prefix of it.
++            if (batch.batch != 1)
++                throw std::invalid_argument("GDN verify: narrow window needs one row");
++            records.conv  = records.conv.slice(1, 0, t);
++            records.key   = records.key.slice(2, 0, t);
++            records.value = records.value.slice(2, 0, t);
++            records.gate  = records.gate.slice(2, 0, t);
++        }
+         auto q             = b.query.view({kd, kh, t, batch.batch});
+         auto k             = b.key.view({kd, kh, t, batch.batch});
+         auto v             = b.value.view({vd, vh, t, batch.batch});
+diff --git a/src/models/qwen4_exp/program/dflash.cpp b/src/models/qwen4_exp/program/dflash.cpp
+index 30b92cd..03cb7df 100644
+--- a/src/models/qwen4_exp/program/dflash.cpp
++++ b/src/models/qwen4_exp/program/dflash.cpp
+@@ -3,6 +3,8 @@
+ 
+ #include "core/transfer.h"
+ 
++#include <algorithm>
++#include <cmath>
+ #include <cstdio>
+ #include <cstdlib>
+ 
+@@ -59,6 +61,12 @@ DraftRuntime::DraftRuntime(const execution::Parameters& parameters, Device devic
+     call.scores        = io->alloc(DType::FP32, {16, k, 1});
+     call.proposal_q    = io->alloc(DType::FP32, {16, k, 1});
+     call.drafts        = io->alloc(DType::I32, {k, 1});
++    call.confidence    = io->alloc(DType::FP32, {k});
++    if (const char* value = std::getenv("NINFER_FLASH_DFLASH2_AUTO")) auto_cost = std::atof(value);
++    if (const char* value = std::getenv("NINFER_FLASH_DFLASH2_AUTO_POWER"))
++        auto_power = std::atof(value);
++    if (!(auto_cost > 0)) auto_cost = 0;
++    if (!(auto_power > 0)) auto_power = 1;
+     const auto config_span = io->alloc_bytes(sizeof(ops::SamplingConfig));
+     const ops::SamplingConfig greedy{};
+     io_memory.copy_from_host(&greedy, sizeof(greedy),
+@@ -69,6 +77,25 @@ DraftRuntime::DraftRuntime(const execution::Parameters& parameters, Device devic
+     features = arena->alloc(DType::BF16, {h, taps, c});
+ }
+ 
++std::uint32_t DraftRuntime::choose(const float* confidence, std::uint32_t extent) {
++    std::uint32_t best = extent;
++    double keep = 1, tokens = 1, expected = 0, best_score = -1, best_expected = 0;
++    for (std::uint32_t j = 1; j <= extent; ++j) {
++        const double p = std::min(1.0, std::max(0.0, double(confidence[j - 1])));
++        keep *= std::pow(p, auto_power);
++        tokens += keep;
++        expected += keep;
++        const double score = tokens / (auto_cost + j + 1);
++        if (auto_cost > 0 && score > best_score) {
++            best_score    = score;
++            best          = j;
++            best_expected = expected;
++        }
++    }
++    pending_predicted = auto_cost > 0 ? best_expected : expected;
++    return best;
++}
++
+ void RankProgramImpl::draft_append(std::uint32_t first, std::uint32_t count) {
+     auto& d = *draft;
+     for (std::uint32_t i = 0; i < count; ++i)
+@@ -113,6 +140,11 @@ void RankProgramImpl::draft_observe_commit(std::uint32_t accepted) {
+         d.live = false;
+         return;
+     }
++    if (!f.proposed.empty()) {
++        d.predicted_kept += d.pending_predicted;
++        d.drafted += f.proposed[0].size();
++        d.kept += accepted ? accepted - 1 : 0;
++    }
+     if (!accepted) return;
+     draft_append(row.main_frontier, accepted);
+     d.frontier += accepted;
+@@ -147,7 +179,12 @@ bool RankProgramImpl::draft_propose(std::vector<TokenId>& out, std::uint32_t ext
+             ++d.fallbacks;
+             return false;
+         }
+-    out.assign(ids, ids + extent);
++    float confidence[16]{};
++    copy_bytes({confidence, k * sizeof(float), Device::cpu()},
++               {d.call.confidence.data, k * sizeof(float), cuda.device()}, cuda);
++    const auto chosen = d.choose(confidence, extent);
++    ++d.widths[chosen];
++    out.assign(ids, ids + chosen);
+     ++d.proposals;
+     return true;
+ }
+diff --git a/src/models/qwen4_exp/program/dflash.h b/src/models/qwen4_exp/program/dflash.h
+index 01f803e..3a3ad94 100644
+--- a/src/models/qwen4_exp/program/dflash.h
++++ b/src/models/qwen4_exp/program/dflash.h
+@@ -10,6 +10,7 @@
+ #include "core/cyclic_kv_cache.h"
+ #include "models/qwen4_exp/execution/dflash.h"
+ 
++#include <array>
+ #include <optional>
+ #include <vector>
+ 
+@@ -36,6 +37,13 @@ struct DraftRuntime {
+     std::uint64_t sequence = 0, generation = 0;
+     std::uint32_t start = 0, frontier = 0;
+     std::uint64_t proposals = 0, fallbacks = 0;
++    // Automatic width: a round verifies the draft count with the best expected tokens per cost,
++    // cost = auto_cost + columns (in verify columns; 0 keeps the fixed window).
++    double auto_cost = 0, auto_power = 1;
++    double predicted_kept = 0, pending_predicted = 0;
++    std::uint64_t kept = 0, drafted = 0;
++    std::array<std::uint64_t, 17> widths{};
++    [[nodiscard]] std::uint32_t choose(const float* confidence, std::uint32_t extent);
+ };
+ 
+ } // namespace ninfer::models::qwen4_exp::detail
+diff --git a/src/models/qwen4_exp/program/execution.cpp b/src/models/qwen4_exp/program/execution.cpp
+index f36bd5f..d744c78 100644
+--- a/src/models/qwen4_exp/program/execution.cpp
++++ b/src/models/qwen4_exp/program/execution.cpp
+@@ -222,7 +222,8 @@ void RankProgramImpl::prepare_main() {
+     if (graphs && host_ple && !f.sequence) {
+         const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+         f.graph             = &graphs->main(batch, f.verify.has_value(), f.visible,
+-                                            f.verify || forward->sample != SampleKind::None);
++                                            f.verify || forward->sample != SampleKind::None,
++                                            f.verify ? f.tokens : 0);
+     }
+     f.layer = 0;
+     if (!f.graph)
+diff --git a/src/models/qwen4_exp/program/graphs.cpp b/src/models/qwen4_exp/program/graphs.cpp
+index 28666e3..27c62d5 100644
+--- a/src/models/qwen4_exp/program/graphs.cpp
++++ b/src/models/qwen4_exp/program/graphs.cpp
+@@ -145,11 +145,11 @@ Graphs::Graphs(RankProgramImpl& owner)
+     : owner_(owner), bounds_(decode_context_bounds(owner.shape.max_context)) {}
+ 
+ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
+-                          GraphPreparation& preparation) {
++                          GraphPreparation& preparation, std::uint32_t width, TextGraph* into) {
+     auto& p             = owner_;
+     auto& r             = p.resources;
+     const auto& buffers = r.plan.persistent.buffers;
+-    const auto tokens   = verify ? p.shape.draft_tokens + 1 : 1;
++    const auto tokens   = width ? width : verify ? p.shape.draft_tokens + 1 : 1;
+     const auto call     = r.main_batch(tokens, batch, bounds_.back());
+     const auto& c       = p.parameters.profile->config.text;
+     const auto t = static_cast<std::int32_t>(tokens), b = static_cast<std::int32_t>(batch);
+@@ -173,7 +173,7 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
+     if (verify) update.emplace<execution::VerifyRecords>(*r.gdn_records);
+     const std::array ple{r.ple_upload->binding(0, tokens, batch),
+                          r.ple_upload->binding(1, tokens, batch)};
+-    auto& selected = verify ? graph.verify : graph.main;
++    auto& selected = into ? *into : verify ? graph.verify : graph.main;
+     {
+         execution::TextRun run(p.parameters, execution, call, update, p.cuda);
+         if (!preparation.capturing()) {
+@@ -312,6 +312,14 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
+             }
+             observation.checkpoint();
+             graph.accept_workspace = r.workspace.peak_used();
++            if (batch == 1 && p.draft && p.draft->auto_cost > 0) {
++                for (std::uint32_t w = 2; w <= p.shape.draft_tokens; ++w) {
++                    inputs.batch(r.main_batch(w, 1, bounds_.back()), bounds_.back());
++                    graph.narrow.push_back(std::make_unique<TextGraph>());
++                    prepare_main(graph, 1, true, observation, w, graph.narrow.back().get());
++                }
++                r.workspace.reset_peak();
++            }
+         }
+     }
+     if (r.experts) r.experts->restore_cache_after_preparation();
+@@ -319,9 +327,11 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
+     r.workspace.reset_peak();
+ }
+ 
+-TextGraph& Graphs::main(std::uint32_t batch, bool verify, std::uint32_t visible, bool head) {
++TextGraph& Graphs::main(std::uint32_t batch, bool verify, std::uint32_t visible, bool head,
++                        std::uint32_t tokens) {
+     auto& group = batches_.at(batch - 1);
+-    auto& graph = verify ? group.verify : group.main;
++    const bool narrow = verify && tokens && tokens != owner_.shape.draft_tokens + 1;
++    auto& graph = narrow ? *group.narrow.at(tokens - 2) : verify ? group.verify : group.main;
+     graph.set_head(head);
+     graph.select(visible);
+     workspace_peak_ = std::max(workspace_peak_, graph.workspace_bytes());
+diff --git a/src/models/qwen4_exp/program/graphs.h b/src/models/qwen4_exp/program/graphs.h
+index 71572f3..acfc7e5 100644
+--- a/src/models/qwen4_exp/program/graphs.h
++++ b/src/models/qwen4_exp/program/graphs.h
+@@ -30,7 +30,7 @@ public:
+     explicit Graphs(RankProgramImpl&);
+     void prepare(GraphInputs&, GraphPreparation&);
+     [[nodiscard]] TextGraph& main(std::uint32_t batch, bool verify, std::uint32_t visible,
+-                                  bool head);
++                                  bool head, std::uint32_t tokens = 0);
+     void draft(std::uint32_t batch, std::span<const execution::BatchView>, ple::Ticket,
+                std::span<const std::uint32_t> extents);
+     void sample(std::uint32_t batch);
+@@ -56,13 +56,16 @@ private:
+ 
+     struct Batch {
+         TextGraph main, verify;
++        // One row only: verify graphs of 2..draft_tokens columns, for automatic width.
++        std::vector<std::unique_ptr<TextGraph>> narrow;
+         GraphSegment sample, accept;
+         std::vector<DraftStep> drafts;
+         DraftChain chain;
+         std::size_t sample_workspace = 0, accept_workspace = 0;
+     };
+ 
+-    void prepare_main(Batch&, std::uint32_t batch, bool verify, GraphPreparation&);
++    void prepare_main(Batch&, std::uint32_t batch, bool verify, GraphPreparation&,
++                      std::uint32_t width = 0, TextGraph* into = nullptr);
+     void prepare_drafts(Batch&, std::uint32_t batch, GraphInputs&, GraphPreparation&);
+     RankProgramImpl& owner_;
+     std::vector<std::uint32_t> bounds_;
+diff --git a/src/models/qwen4_exp/program/internal.h b/src/models/qwen4_exp/program/internal.h
+index c442020..2e6ee4e 100644
+--- a/src/models/qwen4_exp/program/internal.h
++++ b/src/models/qwen4_exp/program/internal.h
+@@ -69,6 +69,7 @@ struct ComputeFrame {
+     // DFlash2: this round's proposal, empty or one row, asked for once per frame.
+     std::vector<std::vector<TokenId>> proposed;
+     bool proposal_tried = false;
++    std::array<std::uint32_t, kMaximumConcurrency> own_extents{};
+     std::uint32_t tokens = 0, visible = 0, layer = 0;
+     std::uint32_t score_at = 0, score_count = 0;
+     std::vector<float> logprobs;
+diff --git a/src/models/qwen4_exp/program/mtp.cpp b/src/models/qwen4_exp/program/mtp.cpp
+index 29d19e6..8297fd6 100644
+--- a/src/models/qwen4_exp/program/mtp.cpp
++++ b/src/models/qwen4_exp/program/mtp.cpp
+@@ -229,8 +229,14 @@ void RankProgramImpl::prepare_mtp() {
+         !f.proposal_tried) {
+         f.proposal_tried = true;
+         std::vector<TokenId> ids;
+-        if (draft_propose(ids, work.draft_extents[0])) f.proposed.push_back(std::move(ids));
++        if (draft_propose(ids, work.draft_extents[0])) {
++            f.own_extents[0] = static_cast<std::uint32_t>(ids.size());
++            f.proposed.push_back(std::move(ids));
++        }
+     }
++    // A drafter round runs the target over just its anchor and chosen drafts; everything after
++    // the forward keeps the full window's layout, which one row's narrower frame is a prefix of.
++    const auto run_tokens = f.proposed.empty() ? k + 1 : f.own_extents[0] + 1;
+     const auto& chains = work.lookup.empty() ? f.proposed : work.lookup;
+     const bool lookup  = !chains.empty();
+     std::array<ple::InputRow, kMaximumConcurrency> inputs;
+@@ -248,7 +254,7 @@ void RankProgramImpl::prepare_mtp() {
+         }
+     }
+     if (host_ple) {
+-        f.ple = lookup ? host_ple->try_require(f.request.ticket, width,
++        f.ple = lookup ? host_ple->try_require(f.request.ticket, run_tokens,
+                                                {inputs.data(), f.rows.size()})
+                        : host_ple->try_begin(f.request.ticket, width,
+                                              {inputs.data(), f.rows.size()});
+@@ -257,7 +263,8 @@ void RankProgramImpl::prepare_mtp() {
+     f.verify.emplace();
+     auto& round   = *f.verify;
+     round.width   = width;
+-    round.extents = work.draft_extents;
++    round.extents = f.proposed.empty() ? std::span<const std::uint32_t>(work.draft_extents)
++                                       : std::span<const std::uint32_t>(f.own_extents.data(), 1);
+     f.tokens      = width;
+     f.sequence    = false;
+     prepare_main_inputs(f.rows, width);
+@@ -327,6 +334,11 @@ void RankProgramImpl::prepare_mtp() {
+         copy_verify_inputs(batch);
+         prepare_device_ple(f.batch);
+     }
++    if (run_tokens != width) {
++        f.tokens = run_tokens;
++        f.batch  = resources.main_batch(static_cast<std::int32_t>(run_tokens), batch, f.visible,
++                                        false);
++    }
+     prepare_main();
+ }
+ 
+diff --git a/src/models/qwen4_exp/program/program.cpp b/src/models/qwen4_exp/program/program.cpp
+index b9c99ea..5b201fb 100644
+--- a/src/models/qwen4_exp/program/program.cpp
++++ b/src/models/qwen4_exp/program/program.cpp
+@@ -46,8 +46,8 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
+                          block - 1);
+         else {
+             draft = std::make_unique<DraftRuntime>(parameters, cuda.device(), shape.draft_tokens);
+-            std::fprintf(stderr, "ninfer: DFlash2 drafter on, %u draft tokens\n",
+-                         shape.draft_tokens);
++            std::fprintf(stderr, "ninfer: DFlash2 drafter on, %u draft tokens, width %s\n",
++                         shape.draft_tokens, draft->auto_cost > 0 ? "automatic" : "fixed");
+         }
+     }
+ }
+@@ -57,10 +57,19 @@ RankProgramImpl::~RankProgramImpl() {
+         drain();
+     } catch (const std::logic_error&) { std::terminate(); } catch (...) {
+     }
+-    if (draft)
++    if (draft) {
+         std::fprintf(stderr, "ninfer: DFlash2 rounds %llu, MTP fallbacks %llu\n",
+                      static_cast<unsigned long long>(draft->proposals),
+                      static_cast<unsigned long long>(draft->fallbacks));
++        std::fprintf(stderr, "ninfer: DFlash2 drafts %llu, kept %llu, predicted kept %.0f; widths",
++                     static_cast<unsigned long long>(draft->drafted),
++                     static_cast<unsigned long long>(draft->kept), draft->predicted_kept);
++        for (std::size_t i = 1; i < draft->widths.size(); ++i)
++            if (draft->widths[i])
++                std::fprintf(stderr, " %zu:%llu", i,
++                             static_cast<unsigned long long>(draft->widths[i]));
++        std::fprintf(stderr, "\n");
++    }
+     graphs.reset();
+     device_graphs.reset();
+     commit_graphs.reset();
+diff --git a/src/ops/flash_dflash/flash_dflash.cu b/src/ops/flash_dflash/flash_dflash.cu
+index d586607..ea00e27 100644
+--- a/src/ops/flash_dflash/flash_dflash.cu
++++ b/src/ops/flash_dflash/flash_dflash.cu
+@@ -200,6 +200,42 @@ RopeFrequencies rope_frequencies(float theta) {
+     return out;
+ }
+ 
++// One block per draft position: the selector's edge scores of its 16 candidates given the chosen
++// predecessor, and the temperature-1 softmax probability of the chosen draft.
++__global__ void selector_confidence_kernel(const std::int32_t* candidates, const float* scores,
++                                           const bf16* projected, const std::int32_t* anchors,
++                                           const bf16* predecessor, const bf16* successor,
++                                           const std::int32_t* drafts, float* out) {
++    __shared__ float partial[16][8];
++    const int i = blockIdx.x, r = threadIdx.x;
++    const int before = i == 0 ? anchors[0] : drafts[i - 1];
++    const float left = __bfloat162float(predecessor[std::int64_t(before) * 256 + r]) *
++                       __bfloat162float(projected[i * 256 + r]);
++    for (int c = 0; c < 16; ++c) {
++        const int id = candidates[i * 16 + c];
++        float sum    = left * __bfloat162float(successor[std::int64_t(id) * 256 + r]);
++        for (int offset = 16; offset > 0; offset >>= 1)
++            sum += __shfl_down_sync(0xffffffffU, sum, offset);
++        if ((r & 31) == 0) partial[c][r >> 5] = sum;
++    }
++    __syncthreads();
++    if (r != 0) return;
++    float edge[16], best = -INFINITY;
++    for (int c = 0; c < 16; ++c) {
++        float sum = scores[i * 16 + c];
++        for (int w = 0; w < 8; ++w) sum += partial[c][w];
++        edge[c] = sum;
++        best    = fmaxf(best, sum);
++    }
++    float total = 0, chosen = 0;
++    for (int c = 0; c < 16; ++c) {
++        const float e = __expf(edge[c] - best);
++        total += e;
++        if (candidates[i * 16 + c] == drafts[i]) chosen = e;
++    }
++    out[i] = chosen / total;
++}
++
+ constexpr int kTop = 16, kTopThreads = 1024;
+ 
+ __device__ inline bool better(float a, int ia, float b, int ib) {
+@@ -391,6 +427,24 @@ void swiglu_packed(const Tensor& gate_up, Tensor& out, CudaExecutionView executi
+     check_launch();
+ }
+ 
++void selector_confidence(const Tensor& candidates, const Tensor& scores, const Tensor& projected,
++                         const Tensor& anchors, const Tensor& predecessor, const Tensor& successor,
++                         const Tensor& drafts, Tensor& out, CudaExecutionView execution) {
++    const int k = drafts.ne[0];
++    require(k > 0 && candidates.dtype == DType::I32 && candidates.ne[0] == 16 &&
++                candidates.ne[1] == k && scores.dtype == DType::FP32 && scores.ne[0] == 16 &&
++                scores.ne[1] == k && projected.dtype == DType::BF16 && projected.ne[0] == 256 &&
++                projected.ne[1] == k && predecessor.ne[0] == 256 && successor.ne[0] == 256 &&
++                out.dtype == DType::FP32 && out.numel() >= k && drafts.dtype == DType::I32,
++            "selector_confidence: invalid operands");
++    selector_confidence_kernel<<<k, 256, 0, execution.stream()>>>(
++        static_cast<const std::int32_t*>(candidates.data), static_cast<const float*>(scores.data),
++        static_cast<const bf16*>(projected.data), static_cast<const std::int32_t*>(anchors.data),
++        static_cast<const bf16*>(predecessor.data), static_cast<const bf16*>(successor.data),
++        static_cast<const std::int32_t*>(drafts.data), static_cast<float*>(out.data));
++    check_launch();
++}
++
+ void logits_top16(const Tensor& logits, std::int32_t valid, std::int32_t columns, Tensor& ids,
+                   Tensor& scores, CudaExecutionView execution) {
+     require(logits.dtype == DType::BF16 && valid >= kTop && valid <= logits.ne[0] && columns > 0 &&
+-- 
+2.43.0
+

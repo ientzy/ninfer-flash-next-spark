@@ -1,0 +1,29 @@
+name: patches
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    name: Patches apply to pinned ninfer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone ninfer and apply the series
+        run: NINFER_DIR="$RUNNER_TEMP/ninfer" scripts/setup.sh --no-build
+      - name: Whitespace check on the result
+        run: git -C "$RUNNER_TEMP/ninfer" log --oneline -9
+
+  lint:
+    name: Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts
+        run: shellcheck scripts/*.sh
+      - name: Python files compile
+        run: python3 -m py_compile bench/bench.py tools/graft_dflash2.py

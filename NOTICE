@@ -1,0 +1,16 @@
+ninfer-flash-next-spark
+Copyright 2026 the ninfer-flash-next-spark authors
+
+Licensed under the Apache License, Version 2.0.
+
+The files in patches/ modify ninfer (https://github.com/Neroued/ninfer), which is licensed under the
+Apache License, Version 2.0, and contain portions of it as context. tools/graft_dflash2.py imports
+ninfer's artifact tools at run time.
+
+The DFlash2 drafter rounds follow the mathematics of the Flash Next DFlash2 implementation in Infernix
+(https://github.com/Wallawalla47/Infernix, Apache License 2.0), as does the idea of choosing the number of
+verified drafts from the drafter's probabilities. The prompt-lookup rounds follow an idea from cinference
+(https://github.com/satellitedown/cinference, Apache License 2.0).
+
+No model weights are distributed with this repository. scripts/install-cuda.sh downloads NVIDIA CUDA
+redistributable archives from NVIDIA; they are covered by NVIDIA's own licence.

@@ -1,0 +1,45 @@
+From 0d2f838dec05b7e19c771d5b702f65437e1e989b Mon Sep 17 00:00:00 2001
+From: ientzy <ientzy@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:40:20 +0200
+Subject: [PATCH 1/9] feat(qwen4_exp): allow MTP draft windows up to 10 on
+ Flash Next
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/models/qwen4_exp/program/planning.cpp | 4 ++--
+ src/product/speculative_options.h         | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/models/qwen4_exp/program/planning.cpp b/src/models/qwen4_exp/program/planning.cpp
+index d77acbe..c4def99 100644
+--- a/src/models/qwen4_exp/program/planning.cpp
++++ b/src/models/qwen4_exp/program/planning.cpp
+@@ -63,8 +63,8 @@ EngineOptions options(const execution::ModelProfile& profile, const EngineOption
+         if (o.speculative.draft_tokens || o.speculative.proposal_head != ProposalHead::Full)
+             throw std::invalid_argument("disabled MTP requires zero drafts and the full head");
+     } else if (o.speculative.backend != SpeculativeBackend::Mtp || !o.speculative.draft_tokens ||
+-               o.speculative.draft_tokens > 5)
+-        throw std::invalid_argument("Qwen4Exp MTP draft count must be in [1,5]");
++               o.speculative.draft_tokens > 10)
++        throw std::invalid_argument("Qwen4Exp MTP draft count must be in [1,10]");
+     if (o.purpose == EnginePurpose::CausalScoring &&
+         (o.max_concurrency != 1 || o.enable_vision ||
+          o.speculative.backend != SpeculativeBackend::None))
+diff --git a/src/product/speculative_options.h b/src/product/speculative_options.h
+index 725ccb7..d2adc84 100644
+--- a/src/product/speculative_options.h
++++ b/src/product/speculative_options.h
+@@ -39,8 +39,8 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options)
+         }
+         return;
+     case SpeculativeBackend::Mtp:
+-        if (options.draft_tokens == 0 || options.draft_tokens > 5) {
+-            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,5]");
++        if (options.draft_tokens == 0 || options.draft_tokens > 10) {
++            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,10]");
+         }
+         return;
+     case SpeculativeBackend::DFlash:
+-- 
+2.43.0
+

@@ -1,0 +1,817 @@
+From 25a172bc47a189bd92f9893d2038328360bb454e Mon Sep 17 00:00:00 2001
+From: ientzy <ientzy@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:02:13 +0200
+Subject: [PATCH 4/9] Flash Next DFlash2: Spark 8-bit drafter layout and fused
+ kernels
+
+The drafter loads q8_g32_fp16 weights when the file set shares
+[key; value; query] and [gate; up] in single objects (graft_dflash2.py --q8).
+New: five q8 linear shapes, fused context K/V store, Q/K/V split with
+norm and rotation, packed SwiGLU. The BF16 file set still loads.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ include/ninfer/ops/flash_dflash.h             |  18 +++
+ src/models/qwen4_exp/execution/dflash.cpp     |  42 +++--
+ src/models/qwen4_exp/execution/parameters.cpp |  27 +++-
+ src/models/qwen4_exp/execution/parameters.h   |   4 +
+ src/ops/flash_dflash/flash_dflash.cu          | 145 ++++++++++++++++++
+ .../linear/projection/q8/dgx_spark/launch.h   |   6 +
+ .../q8/dgx_spark/shapes/n15360_k2560.cu       |  63 ++++++++
+ .../q8/dgx_spark/shapes/n15360_k2560_k32.cu   |  16 ++
+ .../q8/dgx_spark/shapes/n2048_k2560.cu        |  63 ++++++++
+ .../q8/dgx_spark/shapes/n2048_k2560_k32.cu    |  16 ++
+ .../q8/dgx_spark/shapes/n2560_k12800.cu       |  56 +++++++
+ .../q8/dgx_spark/shapes/n2560_k4096.cu        |  56 +++++++
+ .../q8/dgx_spark/shapes/n2560_k7680.cu        |  56 +++++++
+ .../projection/q8/dgx_spark/sources.cmake     |   7 +
+ src/ops/linear/projection/q8/dispatch.cpp     |   5 +
+ src/ops/linear/projection/q8/shapes.h         |  11 ++
+ 16 files changed, 581 insertions(+), 10 deletions(-)
+ create mode 100644 src/ops/linear/projection/q8/dgx_spark/shapes/n15360_k2560.cu
+ create mode 100644 src/ops/linear/projection/q8/dgx_spark/shapes/n15360_k2560_k32.cu
+ create mode 100644 src/ops/linear/projection/q8/dgx_spark/shapes/n2048_k2560.cu
+ create mode 100644 src/ops/linear/projection/q8/dgx_spark/shapes/n2048_k2560_k32.cu
+ create mode 100644 src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k12800.cu
+ create mode 100644 src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k4096.cu
+ create mode 100644 src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k7680.cu
+
+diff --git a/include/ninfer/ops/flash_dflash.h b/include/ninfer/ops/flash_dflash.h
+index 47a8fb7..703c5cf 100644
+--- a/include/ninfer/ops/flash_dflash.h
++++ b/include/ninfer/ops/flash_dflash.h
+@@ -49,6 +49,24 @@ void ring_store(const Tensor& k, const Tensor& v, const Tensor& positions, std::
+ void rmsnorm_tail(const Tensor& residual, const Tensor& weight, float epsilon, Tensor& out,
+                   CudaExecutionView execution);
+ 
++// The Spark drafter layout stores projections of one input in one weight, so their outputs arrive
++// packed. packed is BF16 [(2*Hkv+Hq)*128, W] holding K heads, V heads, then Q heads per column.
++// q [128,Hq,W] and k [128,Hkv,W] receive the per-head RMSNorm and RoPE of rmsnorm_rope.h
++// (positions I32 [W]); v [128,Hkv,W] receives V unchanged. Outputs are completely overwritten.
++void kvq_split_rmsnorm_rope(const Tensor& packed, const Tensor& positions, const Tensor& q_weight,
++                            const Tensor& k_weight, float epsilon, float theta, Tensor& q,
++                            Tensor& k, Tensor& v, CudaExecutionView execution);
++
++// Context K/V of `count` columns into one cyclic layer, from packed BF16 [2*Hkv*128, C] (K heads,
++// then V heads): K is normalized and rotated as above and stored BF16, V is stored FP16, both at
++// slot positions[c] mod capacity of dense [128, padded_capacity, Hkv] rings.
++void context_kv_store(const Tensor& packed, const Tensor& positions, const Tensor& k_weight,
++                      float epsilon, float theta, std::int32_t count, Tensor& ring_k,
++                      Tensor& ring_v, std::int32_t capacity, CudaExecutionView execution);
++
++// out[r,m] = BF16(SiLU(gate_up[r,m]) * gate_up[I+r,m]); gate_up is BF16 [2*I, M], out [I, M].
++void swiglu_packed(const Tensor& gate_up, Tensor& out, CudaExecutionView execution);
++
+ // The 16 largest of the first `valid` rows of each column of BF16 logits [V,M], descending, ties
+ // to the lower row. ids is I32 [16,M], scores FP32 [16,M] (the logits' values).
+ void logits_top16(const Tensor& logits, std::int32_t valid, std::int32_t columns, Tensor& ids,
+diff --git a/src/models/qwen4_exp/execution/dflash.cpp b/src/models/qwen4_exp/execution/dflash.cpp
+index 5714c2e..76efa9a 100644
+--- a/src/models/qwen4_exp/execution/dflash.cpp
++++ b/src/models/qwen4_exp/execution/dflash.cpp
+@@ -40,6 +40,15 @@ void draft_append_context(const Parameters& parameters, MemoryArena& arena, cons
+     const auto where = positions.slice(0, 0, count);
+     for (std::size_t l = 0; l < p.layers.size(); ++l) {
+         const auto& layer = p.layers[l];
++        if (p.shared) {
++            auto scratch = arena.scope();
++            auto packed  = arena.alloc(DType::BF16, {2 * d * heads, count});
++            project(projected, layer.context_kv, packed, cuda);
++            ops::context_kv_store(packed, where, layer.key_norm, config.rms_norm_eps,
++                                  config.rope_theta, count, ring.keys[l], ring.values[l],
++                                  dimension(ring.layers[l].capacity), cuda);
++            continue;
++        }
+         project(projected, layer.context_key, key, cuda);
+         project(projected, layer.context_value, value, cuda);
+         auto heads_view = key.view({d, heads, count});
+@@ -84,6 +93,8 @@ void draft_propose(const Parameters& parameters, MemoryArena& arena, const Draft
+     auto attention    = arena.alloc(DType::BF16, {d, qh, w, 1});
+     auto gate         = arena.alloc(DType::BF16, {inter, w});
+     auto up           = arena.alloc(DType::BF16, {inter, w});
++    auto packed       = arena.alloc(DType::BF16, {d * (qh + 2 * kh), w});
++    auto both         = arena.alloc(DType::BF16, {2 * inter, w});
+     const ops::AttentionHeadGeometry geometry{d, qh, kh};
+     const auto window = config.sliding_window.value();
+     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d)));
+@@ -96,12 +107,20 @@ void draft_propose(const Parameters& parameters, MemoryArena& arena, const Draft
+             project(flat(normalized), layer.attention_projection, coefficients, cuda);
+             ops::dynamic_conv_prepare(normalized, coefficients, layer.attention_base, prepared,
+                                       cuda);
+-            auto qf = q.view({d * qh, w}), kf = key.view({d * kh, w}), vf = value.view({d * kh, w});
+-            project(flat(prepared), layer.query, qf, cuda);
+-            project(flat(prepared), layer.key, kf, cuda);
+-            project(flat(prepared), layer.value, vf, cuda);
+-            ops::rmsnorm_rope(where, layer.query_norm, layer.key_norm, config.rms_norm_eps,
+-                              config.rope_theta, q, key, cuda);
++            if (p.shared) {
++                project(flat(prepared), layer.kvq, packed, cuda);
++                ops::kvq_split_rmsnorm_rope(packed, where, layer.query_norm, layer.key_norm,
++                                            config.rms_norm_eps, config.rope_theta, q, key, value,
++                                            cuda);
++            } else {
++                auto qf = q.view({d * qh, w}), kf = key.view({d * kh, w}),
++                     vf = value.view({d * kh, w});
++                project(flat(prepared), layer.query, qf, cuda);
++                project(flat(prepared), layer.key, kf, cuda);
++                project(flat(prepared), layer.value, vf, cuda);
++                ops::rmsnorm_rope(where, layer.query_norm, layer.key_norm, config.rms_norm_eps,
++                                  config.rope_theta, q, key, cuda);
++            }
+             {
+                 auto scratch = arena.scope();
+                 ops::sliding_window_attention(q, key, value, where, call.valid_columns, geometry,
+@@ -117,9 +136,14 @@ void draft_propose(const Parameters& parameters, MemoryArena& arena, const Draft
+                                        normalized, cuda);
+             project(flat(normalized), layer.mlp_projection, coefficients, cuda);
+             ops::dynamic_conv_prepare(normalized, coefficients, layer.mlp_base, prepared, cuda);
+-            project(flat(prepared), layer.gate, gate, cuda);
+-            project(flat(prepared), layer.up, up, cuda);
+-            ops::swiglu_product(gate, up, std::int64_t(inter) * w, gate, cuda);
++            if (p.shared) {
++                project(flat(prepared), layer.gate_up, both, cuda);
++                ops::swiglu_packed(both, gate, cuda);
++            } else {
++                project(flat(prepared), layer.gate, gate, cuda);
++                project(flat(prepared), layer.up, up, cuda);
++                ops::swiglu_product(gate, up, std::int64_t(inter) * w, gate, cuda);
++            }
+             auto out = flat(branch);
+             project(gate, layer.down, out, cuda);
+             ops::dynamic_conv_add(branch, coefficients, layer.mlp_base, residual, cuda);
+diff --git a/src/models/qwen4_exp/execution/parameters.cpp b/src/models/qwen4_exp/execution/parameters.cpp
+index c092a20..af09a26 100644
+--- a/src/models/qwen4_exp/execution/parameters.cpp
++++ b/src/models/qwen4_exp/execution/parameters.cpp
+@@ -129,8 +129,30 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
+                             p.tensor(d.context_norm),         p.tensor(d.final_norm),
+                             p.tensor(s.predecessor_codebook), p.tensor(s.successor_codebook),
+                             {}};
++        const auto parent = [&](WeightId id) { return model.weight(id).view.parts.at(0).parent; };
++        const auto& first = d.layers.at(0);
++        out.shared = parent(first.attention.query) == parent(first.attention.key) &&
++                     parent(first.mlp.gate) == parent(first.mlp.up);
+         for (const auto& l : d.layers) {
+             const auto& a = l.attention;
++            if (out.shared) {
++                DraftLayerParameters layer;
++                layer.input_norm           = p.tensor(l.input_norm);
++                layer.post_attention_norm  = p.tensor(l.post_attention_norm);
++                layer.query_norm           = p.tensor(a.query_norm);
++                layer.key_norm             = p.tensor(a.key_norm);
++                layer.attention_base       = p.tensor(l.attention_conv.value().base_kernel);
++                layer.mlp_base             = p.tensor(l.mlp_conv.value().base_kernel);
++                layer.kvq                  = p.linear({a.key, a.value, a.query});
++                layer.context_kv           = p.linear({a.context_key, a.context_value});
++                layer.gate_up              = p.linear({l.mlp.gate, l.mlp.up});
++                layer.output               = p.linear({a.output});
++                layer.down                 = p.linear({l.mlp.down});
++                layer.attention_projection = p.linear({l.attention_conv->kernel_projection});
++                layer.mlp_projection       = p.linear({l.mlp_conv->kernel_projection});
++                out.layers.push_back(std::move(layer));
++                continue;
++            }
+             out.layers.push_back({p.tensor(l.input_norm),
+                                   p.tensor(l.post_attention_norm),
+                                   p.tensor(a.query_norm),
+@@ -147,7 +169,10 @@ Parameters::Parameters(const ModelShard& model, std::shared_ptr<const ModelProfi
+                                   p.linear({l.mlp.up}),
+                                   p.linear({l.mlp.down}),
+                                   p.linear({l.attention_conv->kernel_projection}),
+-                                  p.linear({l.mlp_conv->kernel_projection})});
++                                  p.linear({l.mlp_conv->kernel_projection}),
++                                  {},
++                                  {},
++                                  {}});
+         }
+         draft = std::move(out);
+     }
+diff --git a/src/models/qwen4_exp/execution/parameters.h b/src/models/qwen4_exp/execution/parameters.h
+index 7b41c62..da0fe71 100644
+--- a/src/models/qwen4_exp/execution/parameters.h
++++ b/src/models/qwen4_exp/execution/parameters.h
+@@ -80,12 +80,16 @@ struct DraftLayerParameters {
+     Tensor attention_base, mlp_base; // BF16 [H,2,2]: channel, tap, side
+     LinearParameters query, key, value, context_key, context_value, output;
+     LinearParameters gate, up, down, attention_projection, mlp_projection;
++    // Spark layout: [key; value; query] and [gate; up] are single weights, and context K/V
++    // is the first of them cut after value. Set when the file set stores them that way.
++    LinearParameters kvq, context_kv, gate_up;
+ };
+ 
+ struct DraftParameters {
+     LinearParameters feature_projection, selector;
+     Tensor context_norm, final_norm, predecessor_codebook, successor_codebook;
+     std::vector<DraftLayerParameters> layers;
++    bool shared = false;
+ };
+ 
+ class Parameters {
+diff --git a/src/ops/flash_dflash/flash_dflash.cu b/src/ops/flash_dflash/flash_dflash.cu
+index 13ca674..d586607 100644
+--- a/src/ops/flash_dflash/flash_dflash.cu
++++ b/src/ops/flash_dflash/flash_dflash.cu
+@@ -105,6 +105,101 @@ __global__ void ring_store_kernel(const bf16* k, const bf16* v, const std::int32
+     }
+ }
+ 
++// The packed projections of the Spark drafter layout. One block per (column, head) and one
++// thread per rotation pair; the block normalizes its head over 128 values and rotates it.
++struct RopeFrequencies {
++    double value[64];
++};
++
++__device__ inline float head_inverse_rms(const bf16* x, float epsilon, float* partial) {
++    const int p   = threadIdx.x;
++    const float a = __bfloat162float(x[p]), b = __bfloat162float(x[p + 64]);
++    float sum     = a * a + b * b;
++    for (int offset = 16; offset > 0; offset >>= 1) sum += __shfl_down_sync(0xffffffffU, sum, offset);
++    if ((p & 31) == 0) partial[p >> 5] = sum;
++    __syncthreads();
++    return rsqrtf((partial[0] + partial[1]) * (1.0F / 128.0F) + epsilon);
++}
++
++__device__ inline void rotate_pair(const bf16* x, const bf16* weight, float inverse, int position,
++                                   const RopeFrequencies& frequencies, float& low, float& high) {
++    const int p        = threadIdx.x;
++    const double angle = double(position) * frequencies.value[p];
++    const float reduced =
++        float(angle - nearbyint(angle * 0.159154943091895336) * 6.28318530717958648);
++    float s, c;
++    sincosf(reduced, &s, &c);
++    const float a = __bfloat162float(x[p]) * inverse * __bfloat162float(weight[p]);
++    const float b = __bfloat162float(x[p + 64]) * inverse * __bfloat162float(weight[p + 64]);
++    low           = a * c - b * s;
++    high          = b * c + a * s;
++}
++
++// packed is [(2*Hkv+Hq)*128, W]: K heads, V heads, Q heads.
++__global__ void kvq_split_kernel(const bf16* packed, const std::int32_t* positions,
++                                 const bf16* q_weight, const bf16* k_weight, bf16* q, bf16* k,
++                                 bf16* v, int kv_heads, int q_heads, float epsilon,
++                                 RopeFrequencies frequencies) {
++    __shared__ float partial[2];
++    const int column = blockIdx.x, head = blockIdx.y, p = threadIdx.x;
++    const int rows   = (2 * kv_heads + q_heads) * 128;
++    const bf16* x    = packed + std::int64_t(column) * rows + head * 128;
++    if (head >= kv_heads && head < 2 * kv_heads) {
++        bf16* out = v + (std::int64_t(column) * kv_heads + head - kv_heads) * 128;
++        out[p]      = x[p];
++        out[p + 64] = x[p + 64];
++        return;
++    }
++    const bool key     = head < kv_heads;
++    const float inverse = head_inverse_rms(x, epsilon, partial);
++    float low, high;
++    rotate_pair(x, key ? k_weight : q_weight, inverse, positions[column], frequencies, low, high);
++    bf16* out = key ? k + (std::int64_t(column) * kv_heads + head) * 128
++                    : q + (std::int64_t(column) * q_heads + head - 2 * kv_heads) * 128;
++    out[p]      = __float2bfloat16_rn(low);
++    out[p + 64] = __float2bfloat16_rn(high);
++}
++
++// packed is [2*Hkv*128, C]: K heads, V heads. K is normalized, rotated and stored; V is stored.
++__global__ void context_store_kernel(const bf16* packed, const std::int32_t* positions,
++                                     const bf16* k_weight, bf16* ring_k, __half* ring_v,
++                                     int kv_heads, int capacity, int padded, float epsilon,
++                                     RopeFrequencies frequencies) {
++    __shared__ float partial[2];
++    const int column = blockIdx.x, head = blockIdx.y, p = threadIdx.x;
++    const bf16* x    = packed + (std::int64_t(column) * 2 * kv_heads + head) * 128;
++    const int slot   = positions[column] % capacity;
++    if (head >= kv_heads) {
++        __half* out = ring_v + (std::int64_t(head - kv_heads) * padded + slot) * 128;
++        out[p]      = __float2half_rn(__bfloat162float(x[p]));
++        out[p + 64] = __float2half_rn(__bfloat162float(x[p + 64]));
++        return;
++    }
++    const float inverse = head_inverse_rms(x, epsilon, partial);
++    float low, high;
++    rotate_pair(x, k_weight, inverse, positions[column], frequencies, low, high);
++    bf16* out   = ring_k + (std::int64_t(head) * padded + slot) * 128;
++    out[p]      = __float2bfloat16_rn(low);
++    out[p + 64] = __float2bfloat16_rn(high);
++}
++
++// gate_up is [2*I, M]: gate rows, then up rows.
++__global__ void swiglu_packed_kernel(const bf16* gate_up, bf16* out, int inner) {
++    const bf16* source = gate_up + std::int64_t(blockIdx.x) * 2 * inner;
++    bf16* destination  = out + std::int64_t(blockIdx.x) * inner;
++    for (int r = blockIdx.y * blockDim.x + threadIdx.x; r < inner; r += gridDim.y * blockDim.x) {
++        const float g  = __bfloat162float(source[r]);
++        destination[r] = __float2bfloat16_rn(g / (1.0F + __expf(-g)) *
++                                             __bfloat162float(source[inner + r]));
++    }
++}
++
++RopeFrequencies rope_frequencies(float theta) {
++    RopeFrequencies out;
++    for (int i = 0; i < 64; ++i) out.value[i] = std::pow(double(theta), -double(i) / 64.0);
++    return out;
++}
++
+ constexpr int kTop = 16, kTopThreads = 1024;
+ 
+ __device__ inline bool better(float a, int ia, float b, int ib) {
+@@ -246,6 +341,56 @@ void ring_store(const Tensor& k, const Tensor& v, const Tensor& positions, std::
+     check_launch();
+ }
+ 
++void kvq_split_rmsnorm_rope(const Tensor& packed, const Tensor& positions, const Tensor& q_weight,
++                            const Tensor& k_weight, float epsilon, float theta, Tensor& q,
++                            Tensor& k, Tensor& v, CudaExecutionView execution) {
++    const int q_heads = q.ne[1], kv_heads = k.ne[1], width = packed.ne[1];
++    require(packed.dtype == DType::BF16 && packed.is_contiguous() && q.ne[0] == 128 &&
++                k.ne[0] == 128 && v.ne[0] == 128 && v.ne[1] == kv_heads &&
++                packed.ne[0] == (2 * kv_heads + q_heads) * 128 && width > 0 &&
++                q.numel() == std::int64_t(128) * q_heads * width &&
++                k.numel() == std::int64_t(128) * kv_heads * width && v.numel() == k.numel() &&
++                positions.dtype == DType::I32 && positions.numel() >= width &&
++                q_weight.ne[0] == 128 && k_weight.ne[0] == 128 && epsilon > 0 && theta > 0,
++            "kvq_split_rmsnorm_rope: invalid operands");
++    kvq_split_kernel<<<dim3(width, 2 * kv_heads + q_heads), 64, 0, execution.stream()>>>(
++        static_cast<const bf16*>(packed.data), static_cast<const std::int32_t*>(positions.data),
++        static_cast<const bf16*>(q_weight.data), static_cast<const bf16*>(k_weight.data),
++        static_cast<bf16*>(q.data), static_cast<bf16*>(k.data), static_cast<bf16*>(v.data),
++        kv_heads, q_heads, epsilon, rope_frequencies(theta));
++    check_launch();
++}
++
++void context_kv_store(const Tensor& packed, const Tensor& positions, const Tensor& k_weight,
++                      float epsilon, float theta, std::int32_t count, Tensor& ring_k,
++                      Tensor& ring_v, std::int32_t capacity, CudaExecutionView execution) {
++    const int padded = ring_k.ne[1], heads = ring_k.ne[2];
++    require(packed.dtype == DType::BF16 && packed.is_contiguous() && ring_k.ne[0] == 128 &&
++                ring_v.ne[0] == 128 && ring_v.ne[1] == padded && ring_v.ne[2] == heads &&
++                ring_k.dtype == DType::BF16 && ring_v.dtype == DType::FP16 &&
++                packed.ne[0] == 2 * heads * 128 && count > 0 && count <= packed.ne[1] &&
++                positions.dtype == DType::I32 && positions.numel() >= count && capacity > 0 &&
++                capacity <= padded && k_weight.ne[0] == 128 && epsilon > 0 && theta > 0,
++            "context_kv_store: invalid operands");
++    context_store_kernel<<<dim3(count, 2 * heads), 64, 0, execution.stream()>>>(
++        static_cast<const bf16*>(packed.data), static_cast<const std::int32_t*>(positions.data),
++        static_cast<const bf16*>(k_weight.data), static_cast<bf16*>(ring_k.data),
++        static_cast<__half*>(ring_v.data), heads, capacity, padded, epsilon,
++        rope_frequencies(theta));
++    check_launch();
++}
++
++void swiglu_packed(const Tensor& gate_up, Tensor& out, CudaExecutionView execution) {
++    const int inner = out.ne[0], columns = gate_up.ne[1];
++    require(gate_up.dtype == DType::BF16 && out.dtype == DType::BF16 && inner > 0 &&
++                gate_up.ne[0] == 2 * inner && columns > 0 &&
++                out.numel() == std::int64_t(inner) * columns && gate_up.data != out.data,
++            "swiglu_packed: invalid operands");
++    swiglu_packed_kernel<<<dim3(columns, 8), 256, 0, execution.stream()>>>(
++        static_cast<const bf16*>(gate_up.data), static_cast<bf16*>(out.data), inner);
++    check_launch();
++}
++
+ void logits_top16(const Tensor& logits, std::int32_t valid, std::int32_t columns, Tensor& ids,
+                   Tensor& scores, CudaExecutionView execution) {
+     require(logits.dtype == DType::BF16 && valid >= kTop && valid <= logits.ne[0] && columns > 0 &&
+diff --git a/src/ops/linear/projection/q8/dgx_spark/launch.h b/src/ops/linear/projection/q8/dgx_spark/launch.h
+index cee0459..918efe4 100644
+--- a/src/ops/linear/projection/q8/dgx_spark/launch.h
++++ b/src/ops/linear/projection/q8/dgx_spark/launch.h
+@@ -31,4 +31,10 @@ void launch_q8_n16384_k2560_bulk_full(const Tensor& x, const Weight& weight, Ten
+ void launch_q8_n12288_k2560_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
+                                       cudaStream_t stream);
+ 
++void launch_q8_n2048_k2560_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
++                                     cudaStream_t stream);
++
++void launch_q8_n15360_k2560_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
++                                     cudaStream_t stream);
++
+ } // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/projection/q8/dgx_spark/shapes/n15360_k2560.cu b/src/ops/linear/projection/q8/dgx_spark/shapes/n15360_k2560.cu
+new file mode 100644
+index 0000000..8948fda
+--- /dev/null
++++ b/src/ops/linear/projection/q8/dgx_spark/shapes/n15360_k2560.cu
+@@ -0,0 +1,63 @@
++#include "ops/linear/projection/q8/shapes.h"
++#include "ops/linear/projection/q8/dgx_spark/launch.h"
++#include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
++#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
++#include "ops/linear/kernels/q8/q8_a16_tma.cuh"
++
++namespace ninfer::ops::detail {
++namespace {
++template <class Base>
++struct Q8N15360K2560Schedule : Base {};
++
++using Gemv    = Q8A16GemvSchedule<4, 2, 2, 2560, 4>;
++using Small8  = Q8A16SlicedKMmaSchedule<8, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::PaddedZero, 2560>;
++using Small16 = Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::PaddedZero, 2560>;
++using Small24 = Q8A16SlicedKMmaSchedule<24, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::PaddedZero, 2560>;
++using Small40 = Q8A16SlicedKMmaSchedule<40, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::PaddedZero, 2560>;
++using Hot64   = Q8A16TmaMmaSchedule<64, 64, 64, 16, 3, 8, 2560>;
++using Hot96   = Q8A16TmaMmaSchedule<64, 96, 64, 16, 2, 8, 2560>;
++using Bulk128 = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 2560>;
++
++template <class Schedule>
++void gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
++    launch_q8_a16_gemv<Q8N15360K2560Schedule<Schedule>>(
++        q8_linear_operands(x, weight),
++        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
++    launch_q8_a16_sliced_k_mma<Schedule>(
++        q8_linear_operands(x, weight),
++        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void tma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
++    launch_q8_a16_tma_mma<Q8N15360K2560Schedule<Schedule>>(
++        q8_linear_operands(x, weight),
++        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++} // namespace
++
++Q8Launch select_q8_n15360_k2560(std::int32_t tokens) {
++    if (tokens == 1) return gemv<Gemv>;
++    if (tokens <= 8) return sliced<Small8>;
++    if (tokens <= 16) return sliced<Small16>;
++    if (tokens <= 24) return sliced<Small24>;
++    if (tokens <= 40) return sliced<Small40>;
++    if (tokens <= 64) return tma<Hot64>;
++    if (tokens <= 96) return tma<Hot96>;
++    if (tokens <= 128) return tma<Bulk128>;
++    if (tokens <= 192) return tma<Hot96>;
++    if (tokens >= 1024 && tokens % 128 == 0) return launch_q8_n15360_k2560_bulk_full;
++    return tma<Bulk128>;
++}
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/projection/q8/dgx_spark/shapes/n15360_k2560_k32.cu b/src/ops/linear/projection/q8/dgx_spark/shapes/n15360_k2560_k32.cu
+new file mode 100644
+index 0000000..b50cd14
+--- /dev/null
++++ b/src/ops/linear/projection/q8/dgx_spark/shapes/n15360_k2560_k32.cu
+@@ -0,0 +1,16 @@
++#include "ops/linear/kernels/q8/q8_a16_tma_k32.cuh"
++#include "ops/linear/projection/q8/dgx_spark/launch.h"
++
++namespace ninfer::ops::detail {
++namespace {
++struct Schedule : Q8A16TmaK32Schedule<8, 2560> {};
++} // namespace
++
++void launch_q8_n15360_k2560_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
++                                     cudaStream_t stream) {
++    launch_q8_a16_tma_k32<Schedule>(
++        q8_linear_operands(x, weight),
++        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/projection/q8/dgx_spark/shapes/n2048_k2560.cu b/src/ops/linear/projection/q8/dgx_spark/shapes/n2048_k2560.cu
+new file mode 100644
+index 0000000..272bc2c
+--- /dev/null
++++ b/src/ops/linear/projection/q8/dgx_spark/shapes/n2048_k2560.cu
+@@ -0,0 +1,63 @@
++#include "ops/linear/projection/q8/shapes.h"
++#include "ops/linear/projection/q8/dgx_spark/launch.h"
++#include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
++#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
++#include "ops/linear/kernels/q8/q8_a16_tma.cuh"
++
++namespace ninfer::ops::detail {
++namespace {
++template <class Base>
++struct Q8N2048K2560Schedule : Base {};
++
++using Gemv    = Q8A16GemvSchedule<4, 2, 2, 2560, 4>;
++using Small8  = Q8A16SlicedKMmaSchedule<8, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::PaddedZero, 2560>;
++using Small16 = Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::PaddedZero, 2560>;
++using Small24 = Q8A16SlicedKMmaSchedule<24, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::PaddedZero, 2560>;
++using Small40 = Q8A16SlicedKMmaSchedule<40, 4, 1, 1, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::PaddedZero, 2560>;
++using Hot64   = Q8A16TmaMmaSchedule<64, 64, 64, 16, 3, 8, 2560>;
++using Hot96   = Q8A16TmaMmaSchedule<64, 96, 64, 16, 2, 8, 2560>;
++using Bulk128 = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 2560>;
++
++template <class Schedule>
++void gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
++    launch_q8_a16_gemv<Q8N2048K2560Schedule<Schedule>>(
++        q8_linear_operands(x, weight),
++        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
++    launch_q8_a16_sliced_k_mma<Schedule>(
++        q8_linear_operands(x, weight),
++        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void tma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
++    launch_q8_a16_tma_mma<Q8N2048K2560Schedule<Schedule>>(
++        q8_linear_operands(x, weight),
++        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++} // namespace
++
++Q8Launch select_q8_n2048_k2560(std::int32_t tokens) {
++    if (tokens == 1) return gemv<Gemv>;
++    if (tokens <= 8) return sliced<Small8>;
++    if (tokens <= 16) return sliced<Small16>;
++    if (tokens <= 24) return sliced<Small24>;
++    if (tokens <= 40) return sliced<Small40>;
++    if (tokens <= 64) return tma<Hot64>;
++    if (tokens <= 96) return tma<Hot96>;
++    if (tokens <= 128) return tma<Bulk128>;
++    if (tokens <= 192) return tma<Hot96>;
++    if (tokens >= 1024 && tokens % 128 == 0) return launch_q8_n2048_k2560_bulk_full;
++    return tma<Bulk128>;
++}
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/projection/q8/dgx_spark/shapes/n2048_k2560_k32.cu b/src/ops/linear/projection/q8/dgx_spark/shapes/n2048_k2560_k32.cu
+new file mode 100644
+index 0000000..b86be6e
+--- /dev/null
++++ b/src/ops/linear/projection/q8/dgx_spark/shapes/n2048_k2560_k32.cu
+@@ -0,0 +1,16 @@
++#include "ops/linear/kernels/q8/q8_a16_tma_k32.cuh"
++#include "ops/linear/projection/q8/dgx_spark/launch.h"
++
++namespace ninfer::ops::detail {
++namespace {
++struct Schedule : Q8A16TmaK32Schedule<8, 2560> {};
++} // namespace
++
++void launch_q8_n2048_k2560_bulk_full(const Tensor& x, const Weight& weight, Tensor& out,
++                                     cudaStream_t stream) {
++    launch_q8_a16_tma_k32<Schedule>(
++        q8_linear_operands(x, weight),
++        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k12800.cu b/src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k12800.cu
+new file mode 100644
+index 0000000..3da8d97
+--- /dev/null
++++ b/src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k12800.cu
+@@ -0,0 +1,56 @@
++#include "ops/linear/kernels/q8/q8_a16_tma.cuh"
++#include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
++#include "ops/linear/kernels/q8/q8_launch.h"
++#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
++#include "ops/linear/projection/q8/shapes.h"
++#include "ops/linear/projection/q8/dgx_spark/launch.h"
++
++namespace ninfer::ops::detail {
++namespace {
++using Decode  = Q8A16GemvSchedule<4, 1, 2, 12800, 4>;
++using Small16 = Q8A16SlicedKMmaSchedule<16, 8, 1, 2, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::RuntimeActive, 12800>;
++
++// Give this shape its own CUDA entry.
++struct Small32 : Q8A16SlicedKMmaSchedule<32, 8, 1, 2, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                         Q8ActivationStage::RuntimeActive, 12800> {};
++
++struct Hot64 : Q8A16TmaMmaSchedule<32, 64, 16, 16, 1, 0, 12800, 128> {};
++
++struct Hot128 : Q8A16TmaMmaSchedule<64, 128, 32, 32, 1, 0, 12800, 128> {};
++
++using Bulk  = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 12800>;
++using Large = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 0, 12800>;
++
++void decode(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
++    launch_q8_a16_gemv<Decode>(q8_linear_operands(x, w),
++                               LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), y.ne[0]},
++                               LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void sliced(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
++    launch_q8_a16_sliced_k_mma<Schedule>(
++        q8_linear_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), y.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void tma(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
++    launch_q8_a16_tma_mma<Schedule>(q8_linear_operands(x, w),
++                                    LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), y.ne[0]},
++                                    LinearIdentityEpilogue{}, stream);
++}
++} // namespace
++
++Q8Launch select_q8_n2560_k12800(std::int32_t tokens) {
++    if (tokens == 1) return decode;
++    if (tokens <= 8) return launch_q8_a16_sliced_r16_t16_w8_s2;
++    if (tokens <= 16) return sliced<Small16>;
++    if (tokens <= 32) return sliced<Small32>;
++    if (tokens <= 64) return tma<Hot64>;
++    if (tokens <= 128) return tma<Hot128>;
++    if (tokens <= 2048) return tma<Bulk>;
++    return tma<Large>;
++}
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k4096.cu b/src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k4096.cu
+new file mode 100644
+index 0000000..b9fa302
+--- /dev/null
++++ b/src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k4096.cu
+@@ -0,0 +1,56 @@
++#include "ops/linear/kernels/q8/q8_a16_tma.cuh"
++#include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
++#include "ops/linear/kernels/q8/q8_launch.h"
++#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
++#include "ops/linear/projection/q8/shapes.h"
++#include "ops/linear/projection/q8/dgx_spark/launch.h"
++
++namespace ninfer::ops::detail {
++namespace {
++using Decode  = Q8A16GemvSchedule<4, 1, 2, 4096, 4>;
++using Small16 = Q8A16SlicedKMmaSchedule<16, 8, 1, 2, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::RuntimeActive, 4096>;
++
++// Give this shape its own CUDA entry.
++struct Small32 : Q8A16SlicedKMmaSchedule<32, 8, 1, 2, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                         Q8ActivationStage::RuntimeActive, 4096> {};
++
++struct Hot64 : Q8A16TmaMmaSchedule<32, 64, 16, 16, 1, 0, 4096, 128> {};
++
++struct Hot128 : Q8A16TmaMmaSchedule<64, 128, 32, 32, 1, 0, 4096, 128> {};
++
++using Bulk  = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 4096>;
++using Large = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 0, 4096>;
++
++void decode(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
++    launch_q8_a16_gemv<Decode>(q8_linear_operands(x, w),
++                               LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), y.ne[0]},
++                               LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void sliced(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
++    launch_q8_a16_sliced_k_mma<Schedule>(
++        q8_linear_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), y.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void tma(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
++    launch_q8_a16_tma_mma<Schedule>(q8_linear_operands(x, w),
++                                    LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), y.ne[0]},
++                                    LinearIdentityEpilogue{}, stream);
++}
++} // namespace
++
++Q8Launch select_q8_n2560_k4096(std::int32_t tokens) {
++    if (tokens == 1) return decode;
++    if (tokens <= 8) return launch_q8_a16_sliced_r16_t16_w8_s2;
++    if (tokens <= 16) return sliced<Small16>;
++    if (tokens <= 32) return sliced<Small32>;
++    if (tokens <= 64) return tma<Hot64>;
++    if (tokens <= 128) return tma<Hot128>;
++    if (tokens <= 2048) return tma<Bulk>;
++    return tma<Large>;
++}
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k7680.cu b/src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k7680.cu
+new file mode 100644
+index 0000000..134ebdb
+--- /dev/null
++++ b/src/ops/linear/projection/q8/dgx_spark/shapes/n2560_k7680.cu
+@@ -0,0 +1,56 @@
++#include "ops/linear/kernels/q8/q8_a16_tma.cuh"
++#include "ops/linear/kernels/q8/q8_gemv_launch.cuh"
++#include "ops/linear/kernels/q8/q8_launch.h"
++#include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
++#include "ops/linear/projection/q8/shapes.h"
++#include "ops/linear/projection/q8/dgx_spark/launch.h"
++
++namespace ninfer::ops::detail {
++namespace {
++using Decode  = Q8A16GemvSchedule<4, 1, 2, 7680, 4>;
++using Small16 = Q8A16SlicedKMmaSchedule<16, 8, 1, 2, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                        Q8ActivationStage::RuntimeActive, 7680>;
++
++// Give this shape its own CUDA entry.
++struct Small32 : Q8A16SlicedKMmaSchedule<32, 8, 1, 2, Q8ScaleAccess::Shared, Cache::ca, Cache::cg,
++                                         Q8ActivationStage::RuntimeActive, 7680> {};
++
++struct Hot64 : Q8A16TmaMmaSchedule<32, 64, 16, 16, 1, 0, 7680, 128> {};
++
++struct Hot128 : Q8A16TmaMmaSchedule<64, 128, 32, 32, 1, 0, 7680, 128> {};
++
++using Bulk  = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 8, 7680>;
++using Large = Q8A16TmaMmaSchedule<64, 128, 64, 16, 2, 0, 7680>;
++
++void decode(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
++    launch_q8_a16_gemv<Decode>(q8_linear_operands(x, w),
++                               LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), y.ne[0]},
++                               LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void sliced(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
++    launch_q8_a16_sliced_k_mma<Schedule>(
++        q8_linear_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), y.ne[0]},
++        LinearIdentityEpilogue{}, stream);
++}
++
++template <class Schedule>
++void tma(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
++    launch_q8_a16_tma_mma<Schedule>(q8_linear_operands(x, w),
++                                    LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), y.ne[0]},
++                                    LinearIdentityEpilogue{}, stream);
++}
++} // namespace
++
++Q8Launch select_q8_n2560_k7680(std::int32_t tokens) {
++    if (tokens == 1) return decode;
++    if (tokens <= 8) return launch_q8_a16_sliced_r16_t16_w8_s2;
++    if (tokens <= 16) return sliced<Small16>;
++    if (tokens <= 32) return sliced<Small32>;
++    if (tokens <= 64) return tma<Hot64>;
++    if (tokens <= 128) return tma<Hot128>;
++    if (tokens <= 2048) return tma<Bulk>;
++    return tma<Large>;
++}
++} // namespace ninfer::ops::detail
+diff --git a/src/ops/linear/projection/q8/dgx_spark/sources.cmake b/src/ops/linear/projection/q8/dgx_spark/sources.cmake
+index c4a8e9e..68c3b4f 100644
+--- a/src/ops/linear/projection/q8/dgx_spark/sources.cmake
++++ b/src/ops/linear/projection/q8/dgx_spark/sources.cmake
+@@ -19,3 +19,10 @@ target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n204
+ target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n4096_k1024.cu")
+ target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n4096_k1024_k32.cu")
+ target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n4096_k16384.cu")
++target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n2048_k2560.cu")
++target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n2048_k2560_k32.cu")
++target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n15360_k2560.cu")
++target_sources(ninfer_ops_non_rdc PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n15360_k2560_k32.cu")
++target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k4096.cu")
++target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k7680.cu")
++target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/shapes/n2560_k12800.cu")
+diff --git a/src/ops/linear/projection/q8/dispatch.cpp b/src/ops/linear/projection/q8/dispatch.cpp
+index cf32739..0bb8fa5 100644
+--- a/src/ops/linear/projection/q8/dispatch.cpp
++++ b/src/ops/linear/projection/q8/dispatch.cpp
+@@ -22,6 +22,11 @@ constexpr ShapeEntry shape(ShapeSelector select) {
+ 
+ constexpr std::array kShapes{
+ #if NINFER_TARGET_SPARK
++    shape<Q8N2048K2560>(select_q8_n2048_k2560),
++    shape<Q8N15360K2560>(select_q8_n15360_k2560),
++    shape<Q8N2560K4096>(select_q8_n2560_k4096),
++    shape<Q8N2560K7680>(select_q8_n2560_k7680),
++    shape<Q8N2560K12800>(select_q8_n2560_k12800),
+     shape<Q8N4096K16384>(select_q8_n4096_k16384), shape<Q8N4096K1024>(select_q8_n4096_k1024),
+     shape<Q8N4096K4096>(select_q8_n4096_k4096),   shape<Q8N12288K4096>(select_q8_n12288_k4096),
+     shape<Q8N2560K3072>(select_q8_n2560_k3072),   shape<Q8N8192K2560>(select_q8_n8192_k2560),
+diff --git a/src/ops/linear/projection/q8/shapes.h b/src/ops/linear/projection/q8/shapes.h
+index 6a56927..67147f4 100644
+--- a/src/ops/linear/projection/q8/shapes.h
++++ b/src/ops/linear/projection/q8/shapes.h
+@@ -34,6 +34,12 @@ using Q8N16384K2560  = Q8LinearGeometry<16384, 2560>;
+ using Q8N34816K5120  = Q8LinearGeometry<34816, 5120>;
+ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
+ 
++using Q8N2048K2560 = Q8LinearGeometry<2048, 2560>;
++using Q8N15360K2560 = Q8LinearGeometry<15360, 2560>;
++using Q8N2560K4096 = Q8LinearGeometry<2560, 4096>;
++using Q8N2560K7680 = Q8LinearGeometry<2560, 7680>;
++using Q8N2560K12800 = Q8LinearGeometry<2560, 12800>;
++
+ // The dispatcher admits N/K and positive T; each shape owns its complete T selection.
+ [[nodiscard]] Q8Launch select_q8_n1024_k2048(std::int32_t tokens);
+ [[nodiscard]] Q8Launch select_q8_n1024_k5120(std::int32_t tokens);
+@@ -63,5 +69,10 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
+ [[nodiscard]] Q8Launch select_q8_n16384_k2560(std::int32_t tokens);
+ [[nodiscard]] Q8Launch select_q8_n34816_k5120(std::int32_t tokens);
+ [[nodiscard]] Q8Launch select_q8_n248320_k5120(std::int32_t tokens);
++[[nodiscard]] Q8Launch select_q8_n2048_k2560(std::int32_t tokens);
++[[nodiscard]] Q8Launch select_q8_n15360_k2560(std::int32_t tokens);
++[[nodiscard]] Q8Launch select_q8_n2560_k4096(std::int32_t tokens);
++[[nodiscard]] Q8Launch select_q8_n2560_k7680(std::int32_t tokens);
++[[nodiscard]] Q8Launch select_q8_n2560_k12800(std::int32_t tokens);
+ 
+ } // namespace ninfer::ops::detail
+-- 
+2.43.0
+

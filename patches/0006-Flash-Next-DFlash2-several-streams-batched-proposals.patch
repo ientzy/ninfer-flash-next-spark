@@ -1,0 +1,1143 @@
+From 2b197252967a96888f29590cbacce726c721ef9f Mon Sep 17 00:00:00 2001
+From: ientzy <ientzy@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 15:59:10 +0200
+Subject: [PATCH 6/9] Flash Next DFlash2: several streams, batched proposals,
+ automatic width per round
+
+Each stream gets its own drafter ring (a lane, handed out least recently used); the rings
+share one storage so a round's rows draft in one batched pass. A ring counts positions from
+where it started, so a stream that resumes after a cached prefix drafts from a shorter
+context instead of falling back to MTP. Feature capture covers every row of a forward.
+
+Automatic width with several rows picks one window for the round (best expected tokens
+per cost over all rows); the verify forward, accept and commit then run laid out for that
+window, with the GDN replay records and fold viewed at the same width. One row keeps the
+full layout. NINFER_FLASH_DFLASH2_AUTO_ROWS=0 keeps several rows at full width.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ include/ninfer/ops/flash_dflash.h          |   8 +-
+ src/models/qwen4_exp/execution/dflash.cpp  |  64 ++--
+ src/models/qwen4_exp/execution/dflash.h    |  22 +-
+ src/models/qwen4_exp/execution/text.cpp    |   3 +-
+ src/models/qwen4_exp/execution/text.h      |   4 +-
+ src/models/qwen4_exp/program/commit.cpp    |  13 +-
+ src/models/qwen4_exp/program/dflash.cpp    | 328 ++++++++++++++-------
+ src/models/qwen4_exp/program/dflash.h      |  60 ++--
+ src/models/qwen4_exp/program/dispatch.cpp  |   2 +-
+ src/models/qwen4_exp/program/execution.cpp |   7 +-
+ src/models/qwen4_exp/program/graphs.cpp    |  11 +-
+ src/models/qwen4_exp/program/graphs.h      |   2 +-
+ src/models/qwen4_exp/program/internal.h    |  18 +-
+ src/models/qwen4_exp/program/mtp.cpp       |  48 +--
+ src/models/qwen4_exp/program/program.cpp   |   3 +-
+ src/models/qwen4_exp/program/resources.cpp |  20 ++
+ src/models/qwen4_exp/program/resources.h   |  13 +
+ src/ops/flash_dflash/flash_dflash.cu       |  24 +-
+ 18 files changed, 425 insertions(+), 225 deletions(-)
+
+diff --git a/include/ninfer/ops/flash_dflash.h b/include/ninfer/ops/flash_dflash.h
+index 782e649..be18793 100644
+--- a/include/ninfer/ops/flash_dflash.h
++++ b/include/ninfer/ops/flash_dflash.h
+@@ -67,10 +67,10 @@ void context_kv_store(const Tensor& packed, const Tensor& positions, const Tenso
+ // out[r,m] = BF16(SiLU(gate_up[r,m]) * gate_up[I+r,m]); gate_up is BF16 [2*I, M], out [I, M].
+ void swiglu_packed(const Tensor& gate_up, Tensor& out, CudaExecutionView execution);
+ 
+-// One row. out[i] is the candidate selector's temperature-1 probability of drafts[i] among its 16
+-// candidates, given the chosen predecessor (the anchor for i = 0): the softmax of the edge scores
+-// of candidate_selector.h. candidates I32 [16,K], scores FP32 [16,K], projected BF16 [256,K],
+-// codebooks BF16 [256,V], drafts I32 [K], out FP32 [K].
++// out[i,b] is the candidate selector's temperature-1 probability of drafts[i,b] among its 16
++// candidates, given the chosen predecessor (anchors[b] for i = 0): the softmax of the edge scores
++// of candidate_selector.h. candidates I32 [16,K,B], scores FP32 [16,K,B], projected BF16
++// [256,K,B], anchors I32 [B], codebooks BF16 [256,V], drafts I32 [K,B], out FP32 [K,B].
+ void selector_confidence(const Tensor& candidates, const Tensor& scores, const Tensor& projected,
+                          const Tensor& anchors, const Tensor& predecessor, const Tensor& successor,
+                          const Tensor& drafts, Tensor& out, CudaExecutionView execution);
+diff --git a/src/models/qwen4_exp/execution/dflash.cpp b/src/models/qwen4_exp/execution/dflash.cpp
+index c73e35c..608f677 100644
+--- a/src/models/qwen4_exp/execution/dflash.cpp
++++ b/src/models/qwen4_exp/execution/dflash.cpp
+@@ -71,38 +71,40 @@ void draft_propose(const Parameters& parameters, MemoryArena& arena, const Draft
+     const int kh = dimension(config.attention.num_key_value_heads);
+     const int inter = dimension(config.intermediate_size), groups = h / 16;
+     const int rank = dimension(extra.selector_rank);
+-    if (w < 2 || w > 16 || call.ids.ne[1] != 1 || call.drafts.ne[0] != k)
++    const int rows = call.ids.ne[1], m = w * rows, km = k * rows;
++    if (w < 2 || w > 16 || rows < 1 || rows > 8 || call.drafts.ne[0] != k ||
++        call.drafts.ne[1] != rows)
+         throw std::invalid_argument("Qwen4Exp DFlash2: proposal geometry is invalid");
+     auto scope    = arena.scope();
+     auto ids      = call.ids;
+     auto where    = call.positions;
+-    auto residual = arena.alloc(DType::BF16, {h, w, 1});
++    auto residual = arena.alloc(DType::BF16, {h, w, rows});
+     ops::prepare_masked_block(call.anchors, call.frontiers, call.valid_columns,
+                               dimension(config.mask_token_id), ids, where, cuda);
+     {
+-        auto flat = residual.view({h, w});
+-        ops::embedding(ids.view({w}), parameters.text.embedding, flat, cuda);
++        auto flat = residual.view({h, m});
++        ops::embedding(ids.view({m}), parameters.text.embedding, flat, cuda);
+     }
+-    auto normalized   = arena.alloc(DType::BF16, {h, w, 1});
+-    auto prepared     = arena.alloc(DType::BF16, {h, w, 1});
+-    auto branch       = arena.alloc(DType::BF16, {h, w, 1});
+-    auto coefficients = arena.alloc(DType::BF16, {4 * groups, w});
+-    auto q            = arena.alloc(DType::BF16, {d, qh, w, 1});
+-    auto key          = arena.alloc(DType::BF16, {d, kh, w, 1});
+-    auto value        = arena.alloc(DType::BF16, {d, kh, w, 1});
+-    auto attention    = arena.alloc(DType::BF16, {d, qh, w, 1});
+-    auto gate         = arena.alloc(DType::BF16, {inter, w});
+-    auto up           = arena.alloc(DType::BF16, {inter, w});
+-    auto packed       = arena.alloc(DType::BF16, {d * (qh + 2 * kh), w});
+-    auto both         = arena.alloc(DType::BF16, {2 * inter, w});
++    auto normalized   = arena.alloc(DType::BF16, {h, w, rows});
++    auto prepared     = arena.alloc(DType::BF16, {h, w, rows});
++    auto branch       = arena.alloc(DType::BF16, {h, w, rows});
++    auto coefficients = arena.alloc(DType::BF16, {4 * groups, m});
++    auto q            = arena.alloc(DType::BF16, {d, qh, w, rows});
++    auto key          = arena.alloc(DType::BF16, {d, kh, w, rows});
++    auto value        = arena.alloc(DType::BF16, {d, kh, w, rows});
++    auto attention    = arena.alloc(DType::BF16, {d, qh, w, rows});
++    auto gate         = arena.alloc(DType::BF16, {inter, m});
++    auto up           = arena.alloc(DType::BF16, {inter, m});
++    auto packed       = arena.alloc(DType::BF16, {d * (qh + 2 * kh), m});
++    auto both         = arena.alloc(DType::BF16, {2 * inter, m});
+     const ops::AttentionHeadGeometry geometry{d, qh, kh};
+     const auto window = config.sliding_window.value();
+     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d)));
+-    const auto flat   = [&](Tensor& t) { return t.view({h, w}); };
++    const auto flat   = [&](Tensor& t) { return t.view({h, m}); };
+     for (std::size_t l = 0; l < p.layers.size(); ++l) {
+         const auto& layer = p.layers[l];
+         {
+-            ops::plain_rmsnorm_columns(residual, layer.input_norm, config.rms_norm_eps, w,
++            ops::plain_rmsnorm_columns(residual, layer.input_norm, config.rms_norm_eps, m,
+                                        normalized, cuda);
+             project(flat(normalized), layer.attention_projection, coefficients, cuda);
+             ops::dynamic_conv_prepare(normalized, coefficients, layer.attention_base, prepared,
+@@ -113,8 +115,8 @@ void draft_propose(const Parameters& parameters, MemoryArena& arena, const Draft
+                                             config.rms_norm_eps, config.rope_theta, q, key, value,
+                                             cuda);
+             } else {
+-                auto qf = q.view({d * qh, w}), kf = key.view({d * kh, w}),
+-                     vf = value.view({d * kh, w});
++                auto qf = q.view({d * qh, m}), kf = key.view({d * kh, m}),
++                     vf = value.view({d * kh, m});
+                 project(flat(prepared), layer.query, qf, cuda);
+                 project(flat(prepared), layer.key, kf, cuda);
+                 project(flat(prepared), layer.value, vf, cuda);
+@@ -128,11 +130,11 @@ void draft_propose(const Parameters& parameters, MemoryArena& arena, const Draft
+                                               {0, call.max_context}, arena, attention, cuda);
+             }
+             auto out = flat(branch);
+-            project(attention.view({d * qh, w}), layer.output, out, cuda);
++            project(attention.view({d * qh, m}), layer.output, out, cuda);
+             ops::dynamic_conv_add(branch, coefficients, layer.attention_base, residual, cuda);
+         }
+         {
+-            ops::plain_rmsnorm_columns(residual, layer.post_attention_norm, config.rms_norm_eps, w,
++            ops::plain_rmsnorm_columns(residual, layer.post_attention_norm, config.rms_norm_eps, m,
+                                        normalized, cuda);
+             project(flat(normalized), layer.mlp_projection, coefficients, cuda);
+             ops::dynamic_conv_prepare(normalized, coefficients, layer.mlp_base, prepared, cuda);
+@@ -142,31 +144,31 @@ void draft_propose(const Parameters& parameters, MemoryArena& arena, const Draft
+             } else {
+                 project(flat(prepared), layer.gate, gate, cuda);
+                 project(flat(prepared), layer.up, up, cuda);
+-                ops::swiglu_product(gate, up, std::int64_t(inter) * w, gate, cuda);
++                ops::swiglu_product(gate, up, std::int64_t(inter) * m, gate, cuda);
+             }
+             auto out = flat(branch);
+             project(gate, layer.down, out, cuda);
+             ops::dynamic_conv_add(branch, coefficients, layer.mlp_base, residual, cuda);
+         }
+     }
+-    auto hidden = arena.alloc(DType::BF16, {h, k});
++    auto hidden = arena.alloc(DType::BF16, {h, km});
+     ops::rmsnorm_tail(residual, p.final_norm, config.rms_norm_eps, hidden, cuda);
+-    auto logits = arena.alloc(DType::BF16, {dimension(profile.local.vocabulary), k});
++    auto logits = arena.alloc(DType::BF16, {dimension(profile.local.vocabulary), km});
+     project_head(hidden, parameters.mtp->head, logits, arena, cuda);
+-    auto candidates = call.candidates.view({16, k});
+-    auto scores     = call.scores.view({16, k});
+-    ops::logits_top16(logits, dimension(profile.public_tokens), k, candidates, scores, cuda);
+-    auto projected = arena.alloc(DType::BF16, {rank, k});
++    auto candidates = call.candidates.view({16, km});
++    auto scores     = call.scores.view({16, km});
++    ops::logits_top16(logits, dimension(profile.public_tokens), km, candidates, scores, cuda);
++    auto projected = arena.alloc(DType::BF16, {rank, km});
+     project(hidden, p.selector, projected, cuda);
+     auto drafts = call.drafts;
+     auto law    = call.proposal_q;
+-    ops::candidate_selector_path(call.candidates, call.scores, projected.view({rank, k, 1}),
++    ops::candidate_selector_path(call.candidates, call.scores, projected.view({rank, k, rows}),
+                                  call.anchors, p.predecessor_codebook, p.successor_codebook,
+                                  dimension(profile.public_tokens), call.frontiers, call.sampling,
+                                  drafts, law, arena, cuda);
+     auto confidence = call.confidence;
+     ops::selector_confidence(candidates, scores, projected, call.anchors, p.predecessor_codebook,
+-                             p.successor_codebook, call.drafts.view({k}), confidence, cuda);
++                             p.successor_codebook, call.drafts, confidence, cuda);
+ }
+ 
+ } // namespace ninfer::models::qwen4_exp::execution
+diff --git a/src/models/qwen4_exp/execution/dflash.h b/src/models/qwen4_exp/execution/dflash.h
+index 28f3bc9..2f1a8f7 100644
+--- a/src/models/qwen4_exp/execution/dflash.h
++++ b/src/models/qwen4_exp/execution/dflash.h
+@@ -4,8 +4,8 @@
+ // [anchor, K masks] through five sliding-window layers with dynamic convolutions, conditioned on a
+ // cyclic ring of context K/V projected from the target's features (the mean of the four
+ // hyper-connection streams after blocks 5, 15, 25, 35 and 45), then the proposal head and the
+-// conditional candidate selector. One row only. The caller owns the ring, the features and every
+-// io word; nothing here keeps state.
++// conditional candidate selector. A proposal takes 1..8 rows, each with its own ring record. The
++// caller owns the rings, the features and every io word; nothing here keeps state.
+ 
+ #include "core/arena.h"
+ #include "core/cyclic_kv_cache.h"
+@@ -17,8 +17,8 @@
+ namespace ninfer::models::qwen4_exp::execution {
+ 
+ struct DraftRing {
+-    std::span<const CyclicKVCacheLayerView> layers;
+-    std::span<Tensor> keys, values; // each layer's bound BF16 K and FP16 V [D, padded, Hkv]
++    std::span<const CyclicKVCacheLayerView> layers; // a proposal's views select one record a row
++    std::span<Tensor> keys, values; // one record's bound BF16 K and FP16 V [D, padded, Hkv], to append
+ };
+ 
+ // Projects `count` feature columns (features is BF16 [H, taps, C]) at positions[0..count) into
+@@ -28,13 +28,13 @@ void draft_append_context(const Parameters&, MemoryArena&, const Tensor& feature
+                           CudaExecutionView);
+ 
+ struct DraftProposal {
+-    Tensor anchors, frontiers, valid_columns; // I32 [1]
+-    const ops::SamplingConfig* sampling;       // device [1]
+-    Tensor ids, positions;                     // I32 [W,1] scratch
+-    Tensor candidates;                         // I32 [16,K,1]
+-    Tensor scores, proposal_q;                 // FP32 [16,K,1]
+-    Tensor drafts;                             // I32 [K,1]
+-    Tensor confidence;                         // FP32 [K]: selector probability of each draft
++    Tensor anchors, frontiers, valid_columns; // I32 [B]
++    const ops::SamplingConfig* sampling;       // device [B]
++    Tensor ids, positions;                     // I32 [W,B] scratch
++    Tensor candidates;                         // I32 [16,K,B]
++    Tensor scores, proposal_q;                 // FP32 [16,K,B]
++    Tensor drafts;                             // I32 [K,B]
++    Tensor confidence;                         // FP32 [K,B]: selector probability of each draft
+     std::uint32_t max_context = 0;
+ };
+ 
+diff --git a/src/models/qwen4_exp/execution/text.cpp b/src/models/qwen4_exp/execution/text.cpp
+index 23beed1..f4c0faf 100644
+--- a/src/models/qwen4_exp/execution/text.cpp
++++ b/src/models/qwen4_exp/execution/text.cpp
+@@ -136,7 +136,8 @@ void TextRun::combine(std::uint32_t i) {
+         ops::hc_combine_norm(roots_.residual, roots_.output, roots_.injection, norm,
+                              config.norm_epsilon, roots_.residual, roots_.normalized, cuda_);
+     }
+-    if (execution_.draft_features.data && batch_.batch == 1) {
++    if (execution_.draft_features.data &&
++        (batch_.batch == 1 || roots_.residual.ne[2] <= execution_.draft_features.ne[2])) {
+         const auto& taps = parameters_.profile->config.draft.value().target_layer_ids;
+         const auto it    = std::find(taps.begin(), taps.end(), i);
+         if (it != taps.end()) {
+diff --git a/src/models/qwen4_exp/execution/text.h b/src/models/qwen4_exp/execution/text.h
+index 0e5bf08..0634e38 100644
+--- a/src/models/qwen4_exp/execution/text.h
++++ b/src/models/qwen4_exp/execution/text.h
+@@ -19,8 +19,8 @@ struct TextExecution {
+     ParallelExecution* parallel = nullptr;
+     // A preceding producer may use the same communicator on its own stream.
+     const CudaCompletionEvent* first_collective_ready = nullptr;
+-    // DFlash2 target features, BF16 [H, taps, C]: single-row forwards write the stream mean of
+-    // their last min(tokens, C) columns after every tap layer.
++    // DFlash2 target features, BF16 [H, taps, C]: a forward writes the stream mean of its last
++    // min(columns, C) columns after every tap layer (several rows only when all columns fit).
+     Tensor draft_features = {};
+ };
+ 
+diff --git a/src/models/qwen4_exp/program/commit.cpp b/src/models/qwen4_exp/program/commit.cpp
+index 69040b3..60bbd2c 100644
+--- a/src/models/qwen4_exp/program/commit.cpp
++++ b/src/models/qwen4_exp/program/commit.cpp
+@@ -36,7 +36,10 @@ void RankProgramImpl::commit_verify(const Commit& commit) {
+         resources.ingress().subspan(buffers.commit_ingress.offset - buffers.host_region.offset,
+                                     buffers.commit_ingress.bytes),
+         cuda);
+-    if (commit_graphs)
++    if (compute->narrow)
++        execute_mtp_commit(batch, rebuild_history, count_tokens, nullptr, nullptr,
++                           compute->narrow);
++    else if (commit_graphs)
+         commit_graphs->replay(batch, rebuild_history, count_tokens);
+     else
+         execute_mtp_commit(batch, rebuild_history, count_tokens);
+@@ -44,10 +47,11 @@ void RankProgramImpl::commit_verify(const Commit& commit) {
+ 
+ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_history,
+                                          bool count_tokens, DecodeGraphSection* captured_repair,
+-                                         DecodeGraphSection* captured_counts) {
++                                         DecodeGraphSection* captured_counts,
++                                         std::uint32_t columns) {
+     const auto& io   = resources.plan.persistent.buffers;
+     const auto& mtp  = *io.mtp;
+-    const auto width = static_cast<int>(shape.draft_tokens + 1), k = width - 1;
++    const auto width = static_cast<int>(columns ? columns : shape.draft_tokens + 1), k = width - 1;
+     const auto channels = dimension(parameters.profile->config.text.residual_width());
+     const auto hidden   = dimension(parameters.profile->config.text.hidden);
+     const auto row     = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
+@@ -75,7 +79,8 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_histor
+         {aligned, history.ids, history.positions, history.valid_columns,
+          history.rope_positions.view({k, 3, batch})},
+         cuda);
+-    resources.gdn_fold->execute(main.source_offsets, main.destination_offsets, accepted, cuda);
++    (columns ? resources.gdn_narrow.at(columns)->fold : *resources.gdn_fold)
++        .execute(main.source_offsets, main.destination_offsets, accepted, cuda);
+     ops::qsa_tail_extract(resources.states->main_tail(main.source_offsets),
+                           {device_tensor(io.main_qsa.keys).slice(2, 0, batch),
+                            device_tensor(io.main_qsa.coordinates).slice(2, 0, batch),
+diff --git a/src/models/qwen4_exp/program/dflash.cpp b/src/models/qwen4_exp/program/dflash.cpp
+index 03cb7df..012712e 100644
+--- a/src/models/qwen4_exp/program/dflash.cpp
++++ b/src/models/qwen4_exp/program/dflash.cpp
+@@ -21,7 +21,7 @@ std::uint32_t minimum_context() {
+ } // namespace
+ 
+ DraftRuntime::DraftRuntime(const execution::Parameters& parameters, Device device,
+-                           std::uint32_t draft_tokens)
++                           std::uint32_t draft_tokens, std::uint32_t streams)
+     : io_memory(device, kIoBytes), arena_memory(device, kArenaBytes) {
+     const auto& config = parameters.profile->config.draft.value();
+     const int h        = dimension(parameters.profile->config.text.hidden);
+@@ -31,160 +31,272 @@ DraftRuntime::DraftRuntime(const execution::Parameters& parameters, Device devic
+     capacity           = config.sliding_window.value();
+     width              = draft_tokens + 1;
+     minimum            = minimum_context();
+-    const int k        = dimension(draft_tokens), w = dimension(width), c = dimension(capacity);
++    ring_layers        = config.num_hidden_layers;
++    streams            = std::min(std::max(1U, streams), 8U);
++    const int k = dimension(draft_tokens), w = dimension(width), c = dimension(capacity),
++              n = dimension(streams);
+ 
+     StateImageBuilder builder;
+-    const auto layout = plan_cyclic_kv_cache(builder, config.num_hidden_layers, capacity, kh, d);
++    const auto layout = plan_cyclic_kv_cache(builder, ring_layers, capacity, kh, d);
+     const auto image  = builder.finish();
+-    ring_memory       = DeviceBuffer(device, image.image_bytes + 4096);
++    const auto stride = (image.image_bytes + 4095) / 4096 * 4096;
++    ring_memory       = DeviceBuffer(device, stride * streams + 4096);
+     ring_memory.fill(0);
+     io_memory.fill(0);
+     storage.emplace(ring_memory.span(), image);
++    view.emplace(*storage, layout);
+     io.emplace(io_memory.span());
+     arena.emplace(arena_memory.span());
+-    zero = io->alloc(DType::I64, {1});
+-    const CyclicKVCacheView view(*storage, layout);
+-    for (std::uint32_t l = 0; l < config.num_hidden_layers; ++l) {
+-        layers.push_back(view.layer_view(l, zero));
+-        keys.push_back(storage->tensor(layout.k, 0, l));
+-        values.push_back(storage->tensor(layout.v, 0, l));
++    zero    = io->alloc(DType::I64, {1});
++    offsets = io->alloc(DType::I64, {n});
++    for (std::uint32_t l = 0; l < ring_layers; ++l) one.push_back(view->layer_view(l, zero));
++    lanes.resize(streams);
++    for (std::uint32_t i = 0; i < streams; ++i) {
++        auto& lane  = lanes[i];
++        lane.offset = static_cast<std::int64_t>(stride * i);
++        for (std::uint32_t l = 0; l < ring_layers; ++l) {
++            lane.keys.push_back(storage->tensor(layout.k, lane.offset, l));
++            lane.values.push_back(storage->tensor(layout.v, lane.offset, l));
++        }
+     }
+-    words     = io->alloc(DType::I32, {48}); // one word per 64 bytes: Ops want aligned operands
+-    positions = io->alloc(DType::I32, {c});
++    all.anchors       = io->alloc(DType::I32, {n});
++    all.frontiers     = io->alloc(DType::I32, {n});
++    all.valid_columns = io->alloc(DType::I32, {n});
++    all.ids           = io->alloc(DType::I32, {w, n});
++    all.positions     = io->alloc(DType::I32, {w, n});
++    all.candidates    = io->alloc(DType::I32, {16, k, n});
++    all.scores        = io->alloc(DType::FP32, {16, k, n});
++    all.proposal_q    = io->alloc(DType::FP32, {16, k, n});
++    all.drafts        = io->alloc(DType::I32, {k, n});
++    all.confidence    = io->alloc(DType::FP32, {k, n});
++    positions         = io->alloc(DType::I32, {c});
+     host_positions.resize(capacity);
+-    call.anchors       = words.slice(0, 0, 1);
+-    call.frontiers     = words.slice(0, 16, 1);
+-    call.valid_columns = words.slice(0, 32, 1);
+-    call.ids           = io->alloc(DType::I32, {w, 1});
+-    call.positions     = io->alloc(DType::I32, {w, 1});
+-    call.candidates    = io->alloc(DType::I32, {16, k, 1});
+-    call.scores        = io->alloc(DType::FP32, {16, k, 1});
+-    call.proposal_q    = io->alloc(DType::FP32, {16, k, 1});
+-    call.drafts        = io->alloc(DType::I32, {k, 1});
+-    call.confidence    = io->alloc(DType::FP32, {k});
++    const auto config_span = io->alloc_bytes(sizeof(ops::SamplingConfig) * streams);
++    const std::vector<ops::SamplingConfig> greedy(streams);
++    io_memory.copy_from_host(greedy.data(), sizeof(ops::SamplingConfig) * streams,
++                             static_cast<const char*>(config_span.data) -
++                                 static_cast<const char*>(io_memory.data()));
++    all.sampling = static_cast<const ops::SamplingConfig*>(config_span.data);
+     if (const char* value = std::getenv("NINFER_FLASH_DFLASH2_AUTO")) auto_cost = std::atof(value);
+     if (const char* value = std::getenv("NINFER_FLASH_DFLASH2_AUTO_POWER"))
+         auto_power = std::atof(value);
++    if (const char* value = std::getenv("NINFER_FLASH_DFLASH2_AUTO_ROWS"))
++        narrow_rows = std::atoi(value) != 0;
+     if (!(auto_cost > 0)) auto_cost = 0;
+     if (!(auto_power > 0)) auto_power = 1;
+-    const auto config_span = io->alloc_bytes(sizeof(ops::SamplingConfig));
+-    const ops::SamplingConfig greedy{};
+-    io_memory.copy_from_host(&greedy, sizeof(greedy),
+-                             static_cast<const char*>(config_span.data) -
+-                                 static_cast<const char*>(io_memory.data()));
+-    call.sampling = static_cast<const ops::SamplingConfig*>(config_span.data);
+     // The features live at the head of the scratch arena and stay there.
+     features = arena->alloc(DType::BF16, {h, taps, c});
+ }
+ 
+-std::uint32_t DraftRuntime::choose(const float* confidence, std::uint32_t extent) {
+-    std::uint32_t best = extent;
+-    double keep = 1, tokens = 1, expected = 0, best_score = -1, best_expected = 0;
++execution::DraftProposal DraftRuntime::call(std::int32_t rows) const {
++    auto out          = all;
++    out.anchors       = all.anchors.slice(0, 0, rows);
++    out.frontiers     = all.frontiers.slice(0, 0, rows);
++    out.valid_columns = all.valid_columns.slice(0, 0, rows);
++    out.ids           = all.ids.slice(1, 0, rows);
++    out.positions     = all.positions.slice(1, 0, rows);
++    out.candidates    = all.candidates.slice(2, 0, rows);
++    out.scores        = all.scores.slice(2, 0, rows);
++    out.proposal_q    = all.proposal_q.slice(2, 0, rows);
++    out.drafts        = all.drafts.slice(1, 0, rows);
++    out.confidence    = all.confidence.slice(1, 0, rows);
++    return out;
++}
++
++std::vector<CyclicKVCacheLayerView> DraftRuntime::layers(std::int32_t rows) const {
++    std::vector<CyclicKVCacheLayerView> out;
++    const auto table = offsets.slice(0, 0, rows);
++    for (std::uint32_t l = 0; l < ring_layers; ++l) out.push_back(view->layer_view(l, table));
++    return out;
++}
++
++DraftLane* DraftRuntime::find(std::uint64_t sequence, std::uint64_t generation) {
++    for (auto& lane : lanes)
++        if (lane.used && lane.sequence == sequence && lane.generation == generation) return &lane;
++    return nullptr;
++}
++
++DraftLane& DraftRuntime::acquire(std::uint64_t sequence, std::uint64_t generation) {
++    DraftLane* best = nullptr;
++    for (auto& lane : lanes) {
++        if (lane.used == tick) continue; // taken by another row of this frame
++        if (!best || (!lane.live && best->live) ||
++            (lane.live == best->live && lane.used < best->used))
++            best = &lane;
++    }
++    if (!best) throw std::logic_error("Qwen4Exp DFlash2: more rows than drafter lanes");
++    best->live       = false;
++    best->sequence   = sequence;
++    best->generation = generation;
++    return *best;
++}
++
++void DraftRuntime::expected(const float* confidence, std::uint32_t extent, double* out) const {
++    double keep = 1;
++    out[0]      = 0;
+     for (std::uint32_t j = 1; j <= extent; ++j) {
+         const double p = std::min(1.0, std::max(0.0, double(confidence[j - 1])));
+         keep *= std::pow(p, auto_power);
+-        tokens += keep;
+-        expected += keep;
+-        const double score = tokens / (auto_cost + j + 1);
+-        if (auto_cost > 0 && score > best_score) {
+-            best_score    = score;
+-            best          = j;
+-            best_expected = expected;
+-        }
++        out[j] = out[j - 1] + keep;
+     }
+-    pending_predicted = auto_cost > 0 ? best_expected : expected;
+-    return best;
+ }
+ 
+-void RankProgramImpl::draft_append(std::uint32_t first, std::uint32_t count) {
++void RankProgramImpl::draft_append(DraftLane& lane, std::uint32_t column, std::uint32_t first,
++                                   std::uint32_t count) {
+     auto& d = *draft;
+     for (std::uint32_t i = 0; i < count; ++i)
+-        d.host_positions[i] = static_cast<std::int32_t>(first + i);
++        d.host_positions[i] = static_cast<std::int32_t>(first - lane.start + i);
+     copy_bytes({d.positions.data, count * sizeof(std::int32_t), cuda.device()},
+                {d.host_positions.data(), count * sizeof(std::int32_t), Device::cpu()}, cuda);
+-    execution::draft_append_context(parameters, *d.arena, d.features, d.positions,
+-                                    static_cast<std::int32_t>(count), d.ring(), cuda);
++    const auto features =
++        d.features.slice(2, static_cast<std::int32_t>(column), static_cast<std::int32_t>(count));
++    execution::draft_append_context(parameters, *d.arena, features, d.positions,
++                                    static_cast<std::int32_t>(count), d.ring(lane), cuda);
+ }
+ 
+-// A committed-by-construction forward (prefill, replay or a plain step): its captured columns are
+-// the context of positions [frontier + tokens - n, frontier + tokens).
++// A committed-by-construction forward (prefill, replay or a plain step). One row's captured
++// columns are the last min(tokens, capacity) of the forward; several rows are captured whole,
++// row after row, when they fit the feature buffer.
+ void RankProgramImpl::draft_observe_forward() {
+     auto& d       = *draft;
+     const auto& f = *compute;
+-    if (f.rows.size() != 1 || !std::holds_alternative<ForwardWork>(f.request.work.operation) ||
+-        f.rows[0].ids.size() != f.tokens || !f.tokens) {
+-        d.live = false;
+-        return;
++    ++d.tick;
++    const auto rows     = static_cast<std::uint32_t>(f.rows.size());
++    const bool forward  = std::holds_alternative<ForwardWork>(f.request.work.operation) && f.tokens;
++    const bool captured = rows == 1 || std::uint64_t(f.tokens) * rows <= d.capacity;
++    for (std::uint32_t b = 0; b < rows; ++b) {
++        const auto& row = f.rows[b];
++        auto* lane      = d.find(row.member.sequence.value, row.member.sequence.generation);
++        const auto own  = static_cast<std::uint32_t>(row.ids.size());
++        if (!forward || !captured || !own || own > f.tokens || (rows == 1 && own != f.tokens)) {
++            if (lane) lane->live = false;
++            continue;
++        }
++        const auto n      = std::min(own, d.capacity);
++        const auto first  = row.main_frontier + own - n;
++        const auto column = rows == 1 ? 0 : b * f.tokens;
++        const bool same   = lane && lane->live && lane->frontier == row.main_frontier;
++        if (!lane) lane = &d.acquire(row.member.sequence.value, row.member.sequence.generation);
++        if (!same) lane->start = first;
++        draft_append(*lane, column, first, n);
++        lane->live     = true;
++        lane->frontier = row.main_frontier + own;
++        lane->used     = d.tick;
+     }
+-    const auto& row  = f.rows[0];
+-    const auto n     = std::min(f.tokens, d.capacity);
+-    const auto first = row.main_frontier + f.tokens - n;
+-    const bool same  = d.live && d.sequence == row.member.sequence.value &&
+-                       d.generation == row.member.sequence.generation &&
+-                       d.frontier == row.main_frontier;
+-    if (!same) d.start = first;
+-    draft_append(first, n);
+-    d.live       = true;
+-    d.sequence   = row.member.sequence.value;
+-    d.generation = row.member.sequence.generation;
+-    d.frontier   = row.main_frontier + f.tokens;
+ }
+ 
+-// A verify round kept its first `accepted` input columns.
+-void RankProgramImpl::draft_observe_commit(std::uint32_t accepted) {
++// A verify round kept each row's first `accepted` input columns.
++void RankProgramImpl::draft_observe_commit(const Commit& commit) {
+     auto& d       = *draft;
+     const auto& f = *compute;
+-    const auto& row = f.rows[0];
+-    if (f.rows.size() != 1 || !d.live || d.sequence != row.member.sequence.value ||
+-        d.generation != row.member.sequence.generation || d.frontier != row.main_frontier) {
+-        d.live = false;
+-        return;
+-    }
+-    if (!f.proposed.empty()) {
+-        d.predicted_kept += d.pending_predicted;
+-        d.drafted += f.proposed[0].size();
+-        d.kept += accepted ? accepted - 1 : 0;
++    ++d.tick;
++    const auto rows = static_cast<std::uint32_t>(f.rows.size());
++    for (std::uint32_t b = 0; b < rows; ++b) {
++        const auto& row = f.rows[b];
++        auto* lane      = d.find(row.member.sequence.value, row.member.sequence.generation);
++        if (!lane) continue;
++        const auto accepted = b < commit.rows.size() ? commit.rows[b].accepted : 0;
++        if (!lane->live || lane->frontier != row.main_frontier ||
++            std::uint64_t(f.tokens) * rows > d.capacity) {
++            lane->live = false;
++            continue;
++        }
++        if (!f.proposed.empty()) {
++            d.predicted_kept += lane->pending_predicted;
++            d.drafted += f.own_extents[b];
++            d.kept += accepted ? accepted - 1 : 0;
++        }
++        if (!accepted) continue;
++        draft_append(*lane, b * f.tokens, row.main_frontier, accepted);
++        lane->frontier += accepted;
++        lane->used = d.tick;
+     }
+-    if (!accepted) return;
+-    draft_append(row.main_frontier, accepted);
+-    d.frontier += accepted;
+ }
+ 
+-bool RankProgramImpl::draft_propose(std::vector<TokenId>& out, std::uint32_t extent) {
++// Drafts for every row of the round, or nothing: a row whose ring is stale sends the whole round
++// to MTP. With automatic width the rows share one window: the width with the best expected tokens
++// per cost over all rows, cost = auto_cost + rows * columns.
++bool RankProgramImpl::draft_propose(std::vector<std::vector<TokenId>>& out,
++                                    std::span<const std::uint32_t> extents) {
+     auto& d         = *draft;
+-    const auto& row = compute->rows[0];
+-    const auto f    = row.main_frontier;
+-    const auto need = f > d.capacity ? f - d.capacity : 0;
+-    if (!extent || row.ids.size() != 1 || !d.live || d.sequence != row.member.sequence.value ||
+-        d.generation != row.member.sequence.generation || d.frontier != f || d.start > need ||
+-        f - d.start < d.minimum) {
+-        ++d.fallbacks;
+-        return false;
+-    }
+-    std::int32_t words[48]{};
+-    words[0]  = row.ids[0];
+-    words[16] = static_cast<std::int32_t>(f);
+-    words[32] = static_cast<std::int32_t>(d.width);
+-    copy_bytes({d.words.data, sizeof(words), cuda.device()}, {words, sizeof(words), Device::cpu()},
+-               cuda);
+-    d.call.max_context = f;
+-    execution::draft_propose(parameters, *d.arena, d.call, d.ring(), cuda);
+-    std::int32_t ids[16]{};
+-    const auto k = d.width - 1;
+-    copy_bytes({ids, k * sizeof(std::int32_t), Device::cpu()},
+-               {d.call.drafts.data, k * sizeof(std::int32_t), cuda.device()}, cuda);
+-    const auto limit = static_cast<std::int32_t>(parameters.profile->public_tokens);
+-    for (std::uint32_t i = 0; i < extent; ++i)
+-        if (ids[i] < 0 || ids[i] >= limit) {
++    const auto& all = compute->rows;
++    const auto rows = static_cast<std::uint32_t>(all.size());
++    std::array<DraftLane*, kMaximumConcurrency> lanes{};
++    for (std::uint32_t b = 0; b < rows; ++b) {
++        const auto& row = all[b];
++        const auto f    = row.main_frontier;
++        auto* lane      = d.find(row.member.sequence.value, row.member.sequence.generation);
++        if (!extents[b] || row.ids.size() != 1 || !lane || !lane->live || lane->frontier != f ||
++            f < lane->start || f - lane->start < d.minimum) {
+             ++d.fallbacks;
+             return false;
+         }
+-    float confidence[16]{};
+-    copy_bytes({confidence, k * sizeof(float), Device::cpu()},
+-               {d.call.confidence.data, k * sizeof(float), cuda.device()}, cuda);
+-    const auto chosen = d.choose(confidence, extent);
++        lanes[b] = lane;
++    }
++    std::array<std::int32_t, kMaximumConcurrency> anchors{}, frontiers{}, valid{};
++    std::array<std::int64_t, kMaximumConcurrency> offsets{};
++    std::uint32_t longest = 0;
++    for (std::uint32_t b = 0; b < rows; ++b) {
++        const auto length = all[b].main_frontier - lanes[b]->start;
++        anchors[b]        = all[b].ids[0];
++        frontiers[b]      = static_cast<std::int32_t>(length);
++        valid[b]          = static_cast<std::int32_t>(d.width);
++        offsets[b]        = lanes[b]->offset;
++        longest           = std::max(longest, length);
++    }
++    const auto send = [&](const Tensor& to, const void* from, std::size_t bytes) {
++        copy_bytes({to.data, bytes, cuda.device()}, {from, bytes, Device::cpu()}, cuda);
++    };
++    send(d.all.anchors, anchors.data(), rows * sizeof(std::int32_t));
++    send(d.all.frontiers, frontiers.data(), rows * sizeof(std::int32_t));
++    send(d.all.valid_columns, valid.data(), rows * sizeof(std::int32_t));
++    send(d.offsets, offsets.data(), rows * sizeof(std::int64_t));
++    auto call        = d.call(static_cast<std::int32_t>(rows));
++    call.max_context = longest;
++    const auto layers = d.layers(static_cast<std::int32_t>(rows));
++    execution::draft_propose(parameters, *d.arena, call, {layers, {}, {}}, cuda);
++    const auto k     = d.width - 1;
++    const auto limit = static_cast<std::int32_t>(parameters.profile->public_tokens);
++    std::array<std::int32_t, 16 * kMaximumConcurrency> ids{};
++    std::array<float, 16 * kMaximumConcurrency> confidence{};
++    std::array<std::array<double, 17>, kMaximumConcurrency> kept{};
++    copy_bytes({ids.data(), std::size_t(k) * rows * sizeof(std::int32_t), Device::cpu()},
++               {call.drafts.data, std::size_t(k) * rows * sizeof(std::int32_t), cuda.device()},
++               cuda);
++    copy_bytes({confidence.data(), std::size_t(k) * rows * sizeof(float), Device::cpu()},
++               {call.confidence.data, std::size_t(k) * rows * sizeof(float), cuda.device()}, cuda);
++    std::uint32_t widest = 0;
++    for (std::uint32_t b = 0; b < rows; ++b) {
++        for (std::uint32_t i = 0; i < extents[b]; ++i)
++            if (ids[b * k + i] < 0 || ids[b * k + i] >= limit) {
++                ++d.fallbacks;
++                return false;
++            }
++        d.expected(confidence.data() + b * k, extents[b], kept[b].data());
++        widest = std::max(widest, extents[b]);
++    }
++    std::uint32_t chosen = widest;
++    const bool constrained = std::any_of(all.begin(), all.end(),
++                                         [](const auto& row) { return row.constrained; });
++    if (d.auto_cost > 0 && (rows == 1 || (d.narrow_rows && !constrained))) {
++        double best = -1;
++        for (std::uint32_t j = 1; j <= widest; ++j) {
++            double tokens = 0;
++            for (std::uint32_t b = 0; b < rows; ++b) tokens += 1 + kept[b][std::min(j, extents[b])];
++            const double score = tokens / (d.auto_cost + double(rows) * (j + 1));
++            if (score > best) {
++                best   = score;
++                chosen = j;
++            }
++        }
++    }
++    out.clear();
++    for (std::uint32_t b = 0; b < rows; ++b) {
++        const auto own = std::min(chosen, extents[b]);
++        lanes[b]->pending_predicted = kept[b][own];
++        out.emplace_back(ids.begin() + b * k, ids.begin() + b * k + own);
++    }
+     ++d.widths[chosen];
+-    out.assign(ids, ids + chosen);
+     ++d.proposals;
+     return true;
+ }
+diff --git a/src/models/qwen4_exp/program/dflash.h b/src/models/qwen4_exp/program/dflash.h
+index 3a3ad94..11f8a43 100644
+--- a/src/models/qwen4_exp/program/dflash.h
++++ b/src/models/qwen4_exp/program/dflash.h
+@@ -1,9 +1,11 @@
+ #pragma once
+ 
+-// Program-owned state of the DFlash2 drafter: the context ring, the captured target features and
+-// the proposal's io words, for one sequence at a time. The ring describes positions
+-// [start, frontier) of (sequence, generation); anything else makes it stale and the round falls
+-// back to MTP until a forward starts it again.
++// Program-owned state of the DFlash2 drafter: one context ring per stream (a lane), the captured
++// target features and the proposal's io. A lane's ring describes positions [start, frontier) of
++// (sequence, generation); anything else makes it stale and its rounds fall back to MTP until a
++// forward starts it again. The drafter sees positions relative to `start` (its rotary positions
++// only act through differences), so a ring that starts after a cached prefix is simply a shorter
++// context. Lanes are handed out least recently used first; one proposal covers all rows of a round.
+ 
+ #include "core/arena.h"
+ #include "core/buffer.h"
+@@ -16,34 +18,52 @@
+ 
+ namespace ninfer::models::qwen4_exp::detail {
+ 
++struct DraftLane {
++    std::int64_t offset = 0; // the lane's record in the ring storage
++    std::vector<Tensor> keys, values;
++    bool live              = false;
++    std::uint64_t sequence = 0, generation = 0, used = 0;
++    std::uint32_t start = 0, frontier = 0;
++    double pending_predicted = 0;
++};
++
+ struct DraftRuntime {
+-    DraftRuntime(const execution::Parameters&, Device, std::uint32_t draft_tokens);
++    DraftRuntime(const execution::Parameters&, Device, std::uint32_t draft_tokens,
++                 std::uint32_t streams);
+ 
+-    [[nodiscard]] execution::DraftRing ring() { return {layers, keys, values}; }
++    [[nodiscard]] DraftLane* find(std::uint64_t sequence, std::uint64_t generation);
++    [[nodiscard]] DraftLane& acquire(std::uint64_t sequence, std::uint64_t generation);
++    [[nodiscard]] execution::DraftRing ring(DraftLane& lane) {
++        return {one, lane.keys, lane.values};
++    }
++    // The proposal operands and ring views of the first `rows` entries of the io tables.
++    [[nodiscard]] execution::DraftProposal call(std::int32_t rows) const;
++    [[nodiscard]] std::vector<CyclicKVCacheLayerView> layers(std::int32_t rows) const;
+ 
++    std::vector<DraftLane> lanes;
+     DeviceBuffer ring_memory, io_memory, arena_memory;
+     std::optional<StateImageStorage> storage;
+-    std::vector<CyclicKVCacheLayerView> layers;
+-    std::vector<Tensor> keys, values;
++    std::optional<CyclicKVCacheView> view;
++    std::vector<CyclicKVCacheLayerView> one; // one-record views, for the append's geometry
+     std::optional<MemoryArena> io, arena;
+-    Tensor features;       // BF16 [H, taps, capacity]
+-    Tensor positions;      // I32 [capacity]
+-    Tensor words;          // I32 [48]: anchor, frontier and valid columns at 0, 16, 32
+-    Tensor zero;           // I64 [1]
+-    execution::DraftProposal call;
++    Tensor offsets;   // I64 [streams]: each row's ring record
++    Tensor zero;      // I64 [1]
++    execution::DraftProposal all; // operands at full stream count
++    Tensor features;  // BF16 [H, taps, capacity]
++    Tensor positions; // I32 [capacity]
+     std::vector<std::int32_t> host_positions;
+-    std::uint32_t capacity = 0, width = 0, minimum = 1;
+-    bool live              = false;
+-    std::uint64_t sequence = 0, generation = 0;
+-    std::uint32_t start = 0, frontier = 0;
++    std::uint32_t capacity = 0, width = 0, minimum = 1, ring_layers = 0;
++    std::uint64_t tick = 0;
+     std::uint64_t proposals = 0, fallbacks = 0;
+     // Automatic width: a round verifies the draft count with the best expected tokens per cost,
+-    // cost = auto_cost + columns (in verify columns; 0 keeps the fixed window).
++    // cost = auto_cost + rows * columns (in verify columns; 0 keeps the fixed window).
+     double auto_cost = 0, auto_power = 1;
+-    double predicted_kept = 0, pending_predicted = 0;
++    bool narrow_rows = true; // NINFER_FLASH_DFLASH2_AUTO_ROWS=0 keeps several rows at full width
++    double predicted_kept = 0;
+     std::uint64_t kept = 0, drafted = 0;
+     std::array<std::uint64_t, 17> widths{};
+-    [[nodiscard]] std::uint32_t choose(const float* confidence, std::uint32_t extent);
++    // Expected kept drafts of each prefix of one row: out[j] for j drafts, out[0] = 0.
++    void expected(const float* confidence, std::uint32_t extent, double* out) const;
+ };
+ 
+ } // namespace ninfer::models::qwen4_exp::detail
+diff --git a/src/models/qwen4_exp/program/dispatch.cpp b/src/models/qwen4_exp/program/dispatch.cpp
+index 211ad1a..01edd20 100644
+--- a/src/models/qwen4_exp/program/dispatch.cpp
++++ b/src/models/qwen4_exp/program/dispatch.cpp
+@@ -211,7 +211,7 @@ void RankProgramImpl::commit(runtime::ExecutionTicket ticket, runtime::CommandSe
+     gpu_timer.resolve();
+     if (f.verify) {
+         commit_verify(commit);
+-        if (draft) draft_observe_commit(commit.rows.empty() ? 0 : commit.rows[0].accepted);
++        if (draft) draft_observe_commit(commit);
+     } else if (const auto* work = std::get_if<ForwardWork>(&f.request.work.operation);
+              work && work->sample != SampleKind::None) {
+         const auto& io  = resources.plan.persistent.buffers;
+diff --git a/src/models/qwen4_exp/program/execution.cpp b/src/models/qwen4_exp/program/execution.cpp
+index d744c78..9da0ece 100644
+--- a/src/models/qwen4_exp/program/execution.cpp
++++ b/src/models/qwen4_exp/program/execution.cpp
+@@ -213,7 +213,8 @@ void RankProgramImpl::prepare_main() {
+     if (draft) execution.draft_features = draft->features;
+     execution::StateUpdate update = execution::StepUpdate{};
+     if (f.verify)
+-        update.emplace<execution::VerifyRecords>(*resources.gdn_records);
++        update.emplace<execution::VerifyRecords>(
++            resources.verify_records(f.tokens, static_cast<std::uint32_t>(batch)));
+     else if (f.sequence)
+         update = execution::SequenceState{
+             f.rows[0].states.at(parameters.profile->local.rank).source,
+@@ -409,7 +410,9 @@ void RankProgramImpl::prepare_decision() {
+         return;
+     }
+     if (f.verify) {
+-        if (graphs && host_ple)
++        if (f.narrow)
++            accept_forward(batch, f.narrow);
++        else if (graphs && host_ple)
+             graphs->accept(batch);
+         else
+             accept_forward(batch);
+diff --git a/src/models/qwen4_exp/program/graphs.cpp b/src/models/qwen4_exp/program/graphs.cpp
+index 27c62d5..d7bda67 100644
+--- a/src/models/qwen4_exp/program/graphs.cpp
++++ b/src/models/qwen4_exp/program/graphs.cpp
+@@ -170,7 +170,7 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
+                                        p.parallel ? &*p.parallel : nullptr};
+     if (p.draft) execution.draft_features = p.draft->features;
+     execution::StateUpdate update = execution::StepUpdate{};
+-    if (verify) update.emplace<execution::VerifyRecords>(*r.gdn_records);
++    if (verify) update.emplace<execution::VerifyRecords>(r.verify_records(tokens, batch));
+     const std::array ple{r.ple_upload->binding(0, tokens, batch),
+                          r.ple_upload->binding(1, tokens, batch)};
+     auto& selected = into ? *into : verify ? graph.verify : graph.main;
+@@ -312,12 +312,15 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
+             }
+             observation.checkpoint();
+             graph.accept_workspace = r.workspace.peak_used();
+-            if (batch == 1 && p.draft && p.draft->auto_cost > 0) {
++            if (p.draft && p.draft->auto_cost > 0) {
+                 for (std::uint32_t w = 2; w <= p.shape.draft_tokens; ++w) {
+-                    inputs.batch(r.main_batch(w, 1, bounds_.back()), bounds_.back());
++                    inputs.batch(r.main_batch(w, batch, bounds_.back()), bounds_.back());
+                     graph.narrow.push_back(std::make_unique<TextGraph>());
+-                    prepare_main(graph, 1, true, observation, w, graph.narrow.back().get());
++                    prepare_main(graph, batch, true, observation, w, graph.narrow.back().get());
+                 }
++                // Leave the full window's inputs staged, as the steps after this expect.
++                inputs.batch(r.main_batch(p.shape.draft_tokens + 1, batch, bounds_.back()),
++                             bounds_.back());
+                 r.workspace.reset_peak();
+             }
+         }
+diff --git a/src/models/qwen4_exp/program/graphs.h b/src/models/qwen4_exp/program/graphs.h
+index acfc7e5..526c531 100644
+--- a/src/models/qwen4_exp/program/graphs.h
++++ b/src/models/qwen4_exp/program/graphs.h
+@@ -56,7 +56,7 @@ private:
+ 
+     struct Batch {
+         TextGraph main, verify;
+-        // One row only: verify graphs of 2..draft_tokens columns, for automatic width.
++        // Verify graphs of 2..draft_tokens columns, for automatic width.
+         std::vector<std::unique_ptr<TextGraph>> narrow;
+         GraphSegment sample, accept;
+         std::vector<DraftStep> drafts;
+diff --git a/src/models/qwen4_exp/program/internal.h b/src/models/qwen4_exp/program/internal.h
+index 2e6ee4e..8bdca06 100644
+--- a/src/models/qwen4_exp/program/internal.h
++++ b/src/models/qwen4_exp/program/internal.h
+@@ -18,6 +18,7 @@ namespace ninfer::models::qwen4_exp::detail {
+ 
+ class DeviceGraphs;
+ struct DraftRuntime;
++struct DraftLane;
+ 
+ struct ResidentBinding {
+     runtime::ExecutionMember member;
+@@ -66,10 +67,13 @@ struct ComputeFrame {
+     bool first_sample = false, timer_started = false;
+     bool graph_main = false;
+     std::vector<std::uint32_t> draft_visible;
+-    // DFlash2: this round's proposal, empty or one row, asked for once per frame.
++    // DFlash2: this round's proposal, empty or one chain per row, asked for once per frame.
+     std::vector<std::vector<TokenId>> proposed;
+     bool proposal_tried = false;
+     std::array<std::uint32_t, kMaximumConcurrency> own_extents{};
++    // Several rows of a narrow drafter round: every buffer of the round is laid out for this
++    // many columns (0 = the full window; one row keeps the full layout, which it is a prefix of).
++    std::uint32_t narrow = 0;
+     std::uint32_t tokens = 0, visible = 0, layer = 0;
+     std::uint32_t score_at = 0, score_count = 0;
+     std::vector<float> logprobs;
+@@ -130,20 +134,22 @@ public:
+     void commit_verify(const Commit&);
+     void execute_mtp_commit(std::int32_t batch, bool rebuild_history, bool count_tokens,
+                             DecodeGraphSection*                 = nullptr,
+-                            DecodeGraphSection* captured_counts = nullptr);
++                            DecodeGraphSection* captured_counts = nullptr,
++                            std::uint32_t columns = 0);
+     [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, std::int32_t batch,
+                                               std::uint32_t visible);
+     void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
+                        const DecodeGraphDefinition* = nullptr, DecodeGraphChild* = nullptr);
+     void install_decode(std::int32_t batch);
+-    void draft_append(std::uint32_t first, std::uint32_t count);
++    void draft_append(DraftLane&, std::uint32_t column, std::uint32_t first, std::uint32_t count);
+     void draft_observe_forward();
+-    void draft_observe_commit(std::uint32_t accepted);
+-    [[nodiscard]] bool draft_propose(std::vector<TokenId>&, std::uint32_t extent);
++    void draft_observe_commit(const Commit&);
++    [[nodiscard]] bool draft_propose(std::vector<std::vector<TokenId>>&,
++                                     std::span<const std::uint32_t> extents);
+     [[nodiscard]] Tensor draft_proposals(std::int32_t batch);
+     [[nodiscard]] Tensor draft_output_ids(std::uint32_t step, std::int32_t batch);
+     void sample_forward(std::int32_t batch, bool first_token);
+-    void accept_forward(std::int32_t batch);
++    void accept_forward(std::int32_t batch, std::uint32_t columns = 0);
+     [[nodiscard]] DistributedVocabulary vocabulary();
+     void vocabulary_sample(std::int32_t batch, bool first_token);
+     void vocabulary_draft(const Tensor& logits, Tensor& ids);
+diff --git a/src/models/qwen4_exp/program/mtp.cpp b/src/models/qwen4_exp/program/mtp.cpp
+index 8297fd6..f310e9c 100644
+--- a/src/models/qwen4_exp/program/mtp.cpp
++++ b/src/models/qwen4_exp/program/mtp.cpp
+@@ -1,5 +1,6 @@
+ #include "models/qwen4_exp/program/internal.h"
+ #include "models/qwen4_exp/program/dflash.h"
++
+ #include "core/nvtx.h"
+ #include "models/qwen4_exp/execution/mtp.h"
+ #include "core/transfer.h"
+@@ -185,17 +186,17 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
+     ops::scatter(next, resources.states->conditioning(compute->batch.destination_offsets), cuda);
+ }
+ 
+-void RankProgramImpl::accept_forward(std::int32_t batch) {
++void RankProgramImpl::accept_forward(std::int32_t batch, std::uint32_t columns) {
+     if (parallel) {
+         vocabulary_accept(batch);
+         return;
+     }
+     const auto& buffers   = resources.plan.persistent.buffers;
+     const auto& frame     = *buffers.mtp;
+-    const auto width      = shape.draft_tokens + 1;
++    const auto width      = columns ? columns : shape.draft_tokens + 1;
+     const auto vocabulary = parameters.profile->public_tokens;
+     const auto row = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
+-    auto drafts    = draft_proposals(batch);
++    auto drafts    = draft_proposals(batch).slice(0, 0, static_cast<std::int32_t>(width) - 1);
+     auto extents   = row(frame.extents);
+     auto device_configs = device_tensor(*buffers.sampling);
+     auto logits =
+@@ -225,18 +226,29 @@ void RankProgramImpl::prepare_mtp() {
+     const auto batch    = static_cast<std::int32_t>(f.rows.size());
+     const auto k = shape.draft_tokens, width = k + 1;
+     // A DFlash2 round rides the lookup path: the drafter's tokens are known before the verify.
+-    if (draft && work.lookup.empty() && batch == 1 && host_ple && !device_graphs &&
+-        !f.proposal_tried) {
++    if (draft && work.lookup.empty() && host_ple && !device_graphs && !f.proposal_tried) {
+         f.proposal_tried = true;
+-        std::vector<TokenId> ids;
+-        if (draft_propose(ids, work.draft_extents[0])) {
+-            f.own_extents[0] = static_cast<std::uint32_t>(ids.size());
+-            f.proposed.push_back(std::move(ids));
++        if (draft_propose(f.proposed, work.draft_extents)) {
++            for (int b = 0; b < batch; ++b)
++                f.own_extents[b] = static_cast<std::uint32_t>(f.proposed[b].size());
++        } else {
++            f.proposed.clear();
+         }
+     }
+-    // A drafter round runs the target over just its anchor and chosen drafts; everything after
+-    // the forward keeps the full window's layout, which one row's narrower frame is a prefix of.
+-    const auto run_tokens = f.proposed.empty() ? k + 1 : f.own_extents[0] + 1;
++    // A drafter round runs the target over just its anchors and chosen drafts.
++    auto run_tokens = k + 1;
++    if (!f.proposed.empty()) {
++        run_tokens = 1;
++        for (int b = 0; b < batch; ++b) run_tokens = std::max(run_tokens, f.own_extents[b] + 1);
++        const bool constrained = std::any_of(f.rows.begin(), f.rows.end(),
++                                             [](const auto& row) { return row.constrained; });
++        if (!(draft->auto_cost > 0) || (batch > 1 && (constrained || !draft->narrow_rows)))
++            run_tokens = k + 1;
++    }
++    // Several rows lay the whole round out for the narrow window; one row runs the narrow forward
++    // inside the full layout.
++    const auto lay = batch > 1 ? run_tokens : k + 1;
++    f.narrow       = lay != k + 1 ? lay : 0;
+     const auto& chains = work.lookup.empty() ? f.proposed : work.lookup;
+     const bool lookup  = !chains.empty();
+     std::array<ple::InputRow, kMaximumConcurrency> inputs;
+@@ -262,16 +274,16 @@ void RankProgramImpl::prepare_mtp() {
+     }
+     f.verify.emplace();
+     auto& round   = *f.verify;
+-    round.width   = width;
++    round.width   = lay;
+     round.extents = f.proposed.empty() ? std::span<const std::uint32_t>(work.draft_extents)
+-                                       : std::span<const std::uint32_t>(f.own_extents.data(), 1);
+-    f.tokens      = width;
++                                       : std::span<const std::uint32_t>(f.own_extents.data(), f.rows.size());
++    f.tokens      = lay;
+     f.sequence    = false;
+-    prepare_main_inputs(f.rows, width);
++    prepare_main_inputs(f.rows, lay);
+     const auto row_tensor = [&](const TensorRegion& region) {
+         return device_tensor(region).slice(0, 0, batch);
+     };
+-    auto drafts      = draft_proposals(batch);
++    auto drafts      = draft_proposals(batch).slice(0, 0, static_cast<std::int32_t>(lay) - 1);
+     const auto steps = k;
+     std::vector<execution::BatchView> calls;
+     calls.reserve(steps);
+@@ -334,7 +346,7 @@ void RankProgramImpl::prepare_mtp() {
+         copy_verify_inputs(batch);
+         prepare_device_ple(f.batch);
+     }
+-    if (run_tokens != width) {
++    if (run_tokens != lay) {
+         f.tokens = run_tokens;
+         f.batch  = resources.main_batch(static_cast<std::int32_t>(run_tokens), batch, f.visible,
+                                         false);
+diff --git a/src/models/qwen4_exp/program/program.cpp b/src/models/qwen4_exp/program/program.cpp
+index 5b201fb..d2fa526 100644
+--- a/src/models/qwen4_exp/program/program.cpp
++++ b/src/models/qwen4_exp/program/program.cpp
+@@ -45,7 +45,8 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
+                          "draft tokens)\n",
+                          block - 1);
+         else {
+-            draft = std::make_unique<DraftRuntime>(parameters, cuda.device(), shape.draft_tokens);
++            draft = std::make_unique<DraftRuntime>(parameters, cuda.device(), shape.draft_tokens,
++                                                   shape.max_concurrency);
+             std::fprintf(stderr, "ninfer: DFlash2 drafter on, %u draft tokens, width %s\n",
+                          shape.draft_tokens, draft->auto_cost > 0 ? "automatic" : "fixed");
+         }
+diff --git a/src/models/qwen4_exp/program/resources.cpp b/src/models/qwen4_exp/program/resources.cpp
+index 009bac7..1b47501 100644
+--- a/src/models/qwen4_exp/program/resources.cpp
++++ b/src/models/qwen4_exp/program/resources.cpp
+@@ -53,6 +53,26 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
+     if (plan.persistent.buffers.gdn_records) {
+         gdn_records.emplace(backing, *plan.persistent.buffers.gdn_records);
+         gdn_fold.emplace(*gdn_records, states->gdn().all_layers_view({}));
++        const auto& spec = gdn_records->spec;
++        const auto outer = spec.layers * spec.record_capacity;
++        const auto head  = [](const Tensor& plane, std::initializer_list<std::int32_t> shape) {
++            std::int32_t count = 1;
++            for (const auto n : shape) count *= n;
++            return plane.view({static_cast<std::int32_t>(plane.numel())})
++                .slice(0, 0, count)
++                .view(shape);
++        };
++        gdn_narrow.resize(spec.width);
++        for (std::int32_t t = 2; t < spec.width; ++t) {
++            auto narrow       = *gdn_records;
++            narrow.spec.width = t;
++            narrow.conv       = head(gdn_records->conv, {spec.conv_channels, t, outer});
++            narrow.key   = head(gdn_records->key, {spec.key_dim, spec.qk_heads, t, outer});
++            narrow.value = head(gdn_records->value, {spec.value_dim, spec.value_heads, t, outer});
++            narrow.gate  = head(gdn_records->gate, {2, spec.value_heads, t, outer});
++            gdn_narrow[t].emplace(NarrowGdn{
++                narrow, ops::GdnReplayFoldPlan(narrow, states->gdn().all_layers_view({}))});
++        }
+     }
+     if (plan.moe) {
+         std::vector<const moe::Parameters*> layers;
+diff --git a/src/models/qwen4_exp/program/resources.h b/src/models/qwen4_exp/program/resources.h
+index 097e79b..8390063 100644
+--- a/src/models/qwen4_exp/program/resources.h
++++ b/src/models/qwen4_exp/program/resources.h
+@@ -71,6 +71,19 @@ public:
+     std::unique_ptr<context::ContextMigration> compute_actions, context_actions;
+     std::optional<GdnReplayRecords> gdn_records;
+     std::optional<ops::GdnReplayFoldPlan> gdn_fold;
++    // The same record storage laid out for a verify window of fewer columns (index = columns).
++    // Several rows of a narrow drafter round record and fold through these.
++    struct NarrowGdn {
++        GdnReplayRecords records;
++        ops::GdnReplayFoldPlan fold;
++    };
++    std::vector<std::optional<NarrowGdn>> gdn_narrow;
++    [[nodiscard]] const GdnReplayRecords& verify_records(std::uint32_t columns,
++                                                         std::uint32_t batch) const {
++        return batch > 1 && columns < gdn_narrow.size() && gdn_narrow[columns]
++                   ? gdn_narrow[columns]->records
++                   : *gdn_records;
++    }
+     std::unique_ptr<moe::Schedule> experts;
+     std::unique_ptr<ple::UploadSlots> ple_upload;
+     std::unique_ptr<ple::disk::PrepareService> ple_prepare;
+diff --git a/src/ops/flash_dflash/flash_dflash.cu b/src/ops/flash_dflash/flash_dflash.cu
+index ea00e27..d13bf85 100644
+--- a/src/ops/flash_dflash/flash_dflash.cu
++++ b/src/ops/flash_dflash/flash_dflash.cu
+@@ -205,10 +205,10 @@ RopeFrequencies rope_frequencies(float theta) {
+ __global__ void selector_confidence_kernel(const std::int32_t* candidates, const float* scores,
+                                            const bf16* projected, const std::int32_t* anchors,
+                                            const bf16* predecessor, const bf16* successor,
+-                                           const std::int32_t* drafts, float* out) {
++                                           const std::int32_t* drafts, float* out, int k) {
+     __shared__ float partial[16][8];
+-    const int i = blockIdx.x, r = threadIdx.x;
+-    const int before = i == 0 ? anchors[0] : drafts[i - 1];
++    const int i = blockIdx.x, r = threadIdx.x; // i: column over [K,B]
++    const int before = i % k == 0 ? anchors[i / k] : drafts[i - 1];
+     const float left = __bfloat162float(predecessor[std::int64_t(before) * 256 + r]) *
+                        __bfloat162float(projected[i * 256 + r]);
+     for (int c = 0; c < 16; ++c) {
+@@ -430,18 +430,20 @@ void swiglu_packed(const Tensor& gate_up, Tensor& out, CudaExecutionView executi
+ void selector_confidence(const Tensor& candidates, const Tensor& scores, const Tensor& projected,
+                          const Tensor& anchors, const Tensor& predecessor, const Tensor& successor,
+                          const Tensor& drafts, Tensor& out, CudaExecutionView execution) {
+-    const int k = drafts.ne[0];
+-    require(k > 0 && candidates.dtype == DType::I32 && candidates.ne[0] == 16 &&
+-                candidates.ne[1] == k && scores.dtype == DType::FP32 && scores.ne[0] == 16 &&
+-                scores.ne[1] == k && projected.dtype == DType::BF16 && projected.ne[0] == 256 &&
+-                projected.ne[1] == k && predecessor.ne[0] == 256 && successor.ne[0] == 256 &&
+-                out.dtype == DType::FP32 && out.numel() >= k && drafts.dtype == DType::I32,
++    const int k = drafts.ne[0], rows = drafts.ne[1], m = k * rows;
++    require(k > 0 && rows > 0 && candidates.dtype == DType::I32 && candidates.ne[0] == 16 &&
++                candidates.numel() == 16LL * m && scores.dtype == DType::FP32 &&
++                scores.ne[0] == 16 && scores.numel() == 16LL * m &&
++                projected.dtype == DType::BF16 && projected.ne[0] == 256 &&
++                projected.numel() == 256LL * m && anchors.numel() >= rows &&
++                predecessor.ne[0] == 256 && successor.ne[0] == 256 && out.dtype == DType::FP32 &&
++                out.numel() >= m && drafts.dtype == DType::I32,
+             "selector_confidence: invalid operands");
+-    selector_confidence_kernel<<<k, 256, 0, execution.stream()>>>(
++    selector_confidence_kernel<<<m, 256, 0, execution.stream()>>>(
+         static_cast<const std::int32_t*>(candidates.data), static_cast<const float*>(scores.data),
+         static_cast<const bf16*>(projected.data), static_cast<const std::int32_t*>(anchors.data),
+         static_cast<const bf16*>(predecessor.data), static_cast<const bf16*>(successor.data),
+-        static_cast<const std::int32_t*>(drafts.data), static_cast<float*>(out.data));
++        static_cast<const std::int32_t*>(drafts.data), static_cast<float*>(out.data), k);
+     check_launch();
+ }
+ 
+-- 
+2.43.0
+

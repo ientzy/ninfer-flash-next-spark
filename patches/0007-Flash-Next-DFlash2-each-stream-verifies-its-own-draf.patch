@@ -1,0 +1,633 @@
+From bdc3a8489279c0ecd9e113ab55aa7ae814b7f7a1 Mon Sep 17 00:00:00 2001
+From: ientzy <ientzy@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 17:41:53 +0200
+Subject: [PATCH 7/9] Flash Next DFlash2: each stream verifies its own draft
+ count
+
+Several rows of a drafter round keep the full verify layout, and the expert
+layers run only on the columns in use (gathered, computed, scattered back).
+The round takes drafts best first by expected kept tokens and picks the count
+with the best expected tokens per cost. Replaces the shared narrow window for
+several rows, with its narrow record views and uncaptured accept and commit.
+Adds a round timer by row count to the exit statistics.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ include/ninfer/ops/flash_dflash.h            |  5 ++
+ src/models/qwen4_exp/execution/text.cpp      | 11 +++
+ src/models/qwen4_exp/execution/text.h        |  3 +
+ src/models/qwen4_exp/execution/workspace.cpp | 12 ++-
+ src/models/qwen4_exp/program/commit.cpp      | 13 +--
+ src/models/qwen4_exp/program/dflash.cpp      | 93 ++++++++++++++++++--
+ src/models/qwen4_exp/program/dflash.h        | 12 ++-
+ src/models/qwen4_exp/program/execution.cpp   | 12 +--
+ src/models/qwen4_exp/program/graphs.cpp      | 15 +++-
+ src/models/qwen4_exp/program/graphs.h        |  6 +-
+ src/models/qwen4_exp/program/internal.h      | 11 ++-
+ src/models/qwen4_exp/program/mtp.cpp         | 27 +++---
+ src/models/qwen4_exp/program/program.cpp     |  5 ++
+ src/models/qwen4_exp/program/resources.cpp   | 20 -----
+ src/models/qwen4_exp/program/resources.h     | 13 ---
+ src/ops/flash_dflash/flash_dflash.cu         | 21 +++++
+ 16 files changed, 192 insertions(+), 87 deletions(-)
+
+diff --git a/include/ninfer/ops/flash_dflash.h b/include/ninfer/ops/flash_dflash.h
+index be18793..1889de6 100644
+--- a/include/ninfer/ops/flash_dflash.h
++++ b/include/ninfer/ops/flash_dflash.h
+@@ -75,6 +75,11 @@ void selector_confidence(const Tensor& candidates, const Tensor& scores, const T
+                          const Tensor& anchors, const Tensor& predecessor, const Tensor& successor,
+                          const Tensor& drafts, Tensor& out, CudaExecutionView execution);
+ 
++// out[:,v] = source[:,indices[v]]. source is contiguous BF16 [D,T], indices I32 [V] in [0,T),
++// out contiguous BF16 [D,V], disjoint from source. Reads current indices under Graph replay.
++void gather_columns(const Tensor& source, const Tensor& indices, Tensor& out,
++                    CudaExecutionView execution);
++
+ // The 16 largest of the first `valid` rows of each column of BF16 logits [V,M], descending, ties
+ // to the lower row. ids is I32 [16,M], scores FP32 [16,M] (the logits' values).
+ void logits_top16(const Tensor& logits, std::int32_t valid, std::int32_t columns, Tensor& ids,
+diff --git a/src/models/qwen4_exp/execution/text.cpp b/src/models/qwen4_exp/execution/text.cpp
+index f4c0faf..e6e43c3 100644
+--- a/src/models/qwen4_exp/execution/text.cpp
++++ b/src/models/qwen4_exp/execution/text.cpp
+@@ -115,6 +115,17 @@ void TextRun::finish_mixer(std::uint32_t i) {
+ 
+ void TextRun::resident_moe(std::uint32_t i) {
+     const auto& p = parameters_.text.layers[i].moe;
++    if (execution_.expert_columns.data) {
++        auto& arena  = execution_.workspace;
++        auto scope   = arena.scope();
++        const auto h = roots_.input.ne[0], v = execution_.expert_columns.ne[0];
++        auto in      = arena.alloc(DType::BF16, {h, v});
++        auto out     = arena.alloc(DType::BF16, {h, v});
++        ops::gather_columns(roots_.input, execution_.expert_columns, in, cuda_);
++        moe::execute(in, p, p.resident, ops::MoeEpilogue::Write, out, arena, cuda_);
++        ops::scatter(out, execution_.expert_columns, roots_.output, cuda_);
++        return;
++    }
+     moe::execute(roots_.input, p, p.resident, ops::MoeEpilogue::Write, roots_.output,
+                  execution_.workspace, cuda_);
+ }
+diff --git a/src/models/qwen4_exp/execution/text.h b/src/models/qwen4_exp/execution/text.h
+index 0634e38..035fed4 100644
+--- a/src/models/qwen4_exp/execution/text.h
++++ b/src/models/qwen4_exp/execution/text.h
+@@ -22,6 +22,9 @@ struct TextExecution {
+     // DFlash2 target features, BF16 [H, taps, C]: a forward writes the stream mean of its last
+     // min(columns, C) columns after every tap layer (several rows only when all columns fit).
+     Tensor draft_features = {};
++    // I32 [V] columns of the window. When set, the expert layers run on these columns only; the
++    // others keep stale values, so they must lie outside every row's valid columns.
++    Tensor expert_columns = {};
+ };
+ 
+ // Activations stay live across the Host PLE handoff. All borrowed views follow the Program's
+diff --git a/src/models/qwen4_exp/execution/workspace.cpp b/src/models/qwen4_exp/execution/workspace.cpp
+index bd25ac2..b1e4fc0 100644
+--- a/src/models/qwen4_exp/execution/workspace.cpp
++++ b/src/models/qwen4_exp/execution/workspace.cpp
+@@ -75,8 +75,16 @@ std::size_t body(const ModelProfile& p, const EngineOptions& options, int first,
+             }
+         }
+         scratch(ops::hc_mix_workspace_capacity_bytes(layer.moe_hc, minimum, columns));
+-        scratch(moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum, columns,
+-                                     layer.moe.subset));
++        {
++            // Room for the gathered input and output of a forward that runs chosen columns.
++            auto scope = a.scope();
++            if (!mtp && !prefill) {
++                (void)a.alloc(DType::BF16, {dimension(p.config.text.hidden), columns});
++                (void)a.alloc(DType::BF16, {dimension(p.config.text.hidden), columns});
++            }
++            scratch(moe::workspace_bytes(layer.moe.math, ops::MoeEpilogue::Write, minimum, columns,
++                                         layer.moe.subset));
++        }
+         if (!mtp && offload) {
+             scratch(offload->workspace_bytes(layer.moe.bank, minimum, columns));
+         }
+diff --git a/src/models/qwen4_exp/program/commit.cpp b/src/models/qwen4_exp/program/commit.cpp
+index 60bbd2c..69040b3 100644
+--- a/src/models/qwen4_exp/program/commit.cpp
++++ b/src/models/qwen4_exp/program/commit.cpp
+@@ -36,10 +36,7 @@ void RankProgramImpl::commit_verify(const Commit& commit) {
+         resources.ingress().subspan(buffers.commit_ingress.offset - buffers.host_region.offset,
+                                     buffers.commit_ingress.bytes),
+         cuda);
+-    if (compute->narrow)
+-        execute_mtp_commit(batch, rebuild_history, count_tokens, nullptr, nullptr,
+-                           compute->narrow);
+-    else if (commit_graphs)
++    if (commit_graphs)
+         commit_graphs->replay(batch, rebuild_history, count_tokens);
+     else
+         execute_mtp_commit(batch, rebuild_history, count_tokens);
+@@ -47,11 +44,10 @@ void RankProgramImpl::commit_verify(const Commit& commit) {
+ 
+ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_history,
+                                          bool count_tokens, DecodeGraphSection* captured_repair,
+-                                         DecodeGraphSection* captured_counts,
+-                                         std::uint32_t columns) {
++                                         DecodeGraphSection* captured_counts) {
+     const auto& io   = resources.plan.persistent.buffers;
+     const auto& mtp  = *io.mtp;
+-    const auto width = static_cast<int>(columns ? columns : shape.draft_tokens + 1), k = width - 1;
++    const auto width = static_cast<int>(shape.draft_tokens + 1), k = width - 1;
+     const auto channels = dimension(parameters.profile->config.text.residual_width());
+     const auto hidden   = dimension(parameters.profile->config.text.hidden);
+     const auto row     = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
+@@ -79,8 +75,7 @@ void RankProgramImpl::execute_mtp_commit(std::int32_t batch, bool rebuild_histor
+         {aligned, history.ids, history.positions, history.valid_columns,
+          history.rope_positions.view({k, 3, batch})},
+         cuda);
+-    (columns ? resources.gdn_narrow.at(columns)->fold : *resources.gdn_fold)
+-        .execute(main.source_offsets, main.destination_offsets, accepted, cuda);
++    resources.gdn_fold->execute(main.source_offsets, main.destination_offsets, accepted, cuda);
+     ops::qsa_tail_extract(resources.states->main_tail(main.source_offsets),
+                           {device_tensor(io.main_qsa.keys).slice(2, 0, batch),
+                            device_tensor(io.main_qsa.coordinates).slice(2, 0, batch),
+diff --git a/src/models/qwen4_exp/program/dflash.cpp b/src/models/qwen4_exp/program/dflash.cpp
+index 012712e..b392a12 100644
+--- a/src/models/qwen4_exp/program/dflash.cpp
++++ b/src/models/qwen4_exp/program/dflash.cpp
+@@ -70,6 +70,14 @@ DraftRuntime::DraftRuntime(const execution::Parameters& parameters, Device devic
+     all.drafts        = io->alloc(DType::I32, {k, n});
+     all.confidence    = io->alloc(DType::FP32, {k, n});
+     positions         = io->alloc(DType::I32, {c});
++    columns           = io->alloc(DType::I32, {w * n});
++    {
++        std::vector<std::int32_t> identity(static_cast<std::size_t>(w) * n);
++        for (std::size_t i = 0; i < identity.size(); ++i) identity[i] = static_cast<std::int32_t>(i);
++        io_memory.copy_from_host(identity.data(), identity.size() * sizeof(std::int32_t),
++                                 static_cast<const char*>(columns.data) -
++                                     static_cast<const char*>(io_memory.data()));
++    }
+     host_positions.resize(capacity);
+     const auto config_span = io->alloc_bytes(sizeof(ops::SamplingConfig) * streams);
+     const std::vector<ops::SamplingConfig> greedy(streams);
+@@ -82,6 +90,8 @@ DraftRuntime::DraftRuntime(const execution::Parameters& parameters, Device devic
+         auto_power = std::atof(value);
+     if (const char* value = std::getenv("NINFER_FLASH_DFLASH2_AUTO_ROWS"))
+         narrow_rows = std::atoi(value) != 0;
++    if (const char* value = std::getenv("NINFER_FLASH_DFLASH2_AUTO_ROW"))
++        row_cost = std::max(0.0, std::atof(value));
+     if (!(auto_cost > 0)) auto_cost = 0;
+     if (!(auto_power > 0)) auto_power = 1;
+     // The features live at the head of the scratch arena and stay there.
+@@ -276,28 +286,93 @@ bool RankProgramImpl::draft_propose(std::vector<std::vector<TokenId>>& out,
+         widest = std::max(widest, extents[b]);
+     }
+     std::uint32_t chosen = widest;
+-    const bool constrained = std::any_of(all.begin(), all.end(),
+-                                         [](const auto& row) { return row.constrained; });
+-    if (d.auto_cost > 0 && (rows == 1 || (d.narrow_rows && !constrained))) {
++    std::array<std::uint32_t, kMaximumConcurrency> own{};
++    for (std::uint32_t b = 0; b < rows; ++b) own[b] = extents[b];
++    compute->compact = 0;
++    if (d.auto_cost > 0 && rows == 1) {
+         double best = -1;
+         for (std::uint32_t j = 1; j <= widest; ++j) {
+-            double tokens = 0;
+-            for (std::uint32_t b = 0; b < rows; ++b) tokens += 1 + kept[b][std::min(j, extents[b])];
+-            const double score = tokens / (d.auto_cost + double(rows) * (j + 1));
++            const double score = (1 + kept[0][std::min(j, extents[0])]) / (d.auto_cost + j + 1);
+             if (score > best) {
+                 best   = score;
+                 chosen = j;
+             }
+         }
++        own[0] = std::min(chosen, extents[0]);
++    } else if (d.auto_cost > 0 && d.narrow_rows) {
++        // Every row keeps its first draft and a constrained row its whole window. The other
++        // drafts are taken best first, by the tokens each is expected to add, and the round
++        // uses the count with the best expected tokens per cost.
++        std::array<std::uint32_t, kMaximumConcurrency> taken{};
++        std::array<std::array<std::uint32_t, kMaximumConcurrency>, 17> plan{};
++        double tokens = rows, best = -1;
++        std::uint32_t used = 0;
++        for (std::uint32_t b = 0; b < rows; ++b) {
++            taken[b] = all[b].constrained ? extents[b] : 1;
++            tokens += kept[b][taken[b]];
++            used += taken[b];
++        }
++        for (std::uint32_t t = 2; t <= d.width; ++t) {
++            const auto slots = (t - 1) * rows;
++            while (used < slots) {
++                std::uint32_t pick = rows;
++                double gain        = -1;
++                for (std::uint32_t b = 0; b < rows; ++b) {
++                    if (taken[b] >= extents[b]) continue;
++                    const double g = kept[b][taken[b] + 1] - kept[b][taken[b]];
++                    if (g > gain) {
++                        gain = g;
++                        pick = b;
++                    }
++                }
++                if (pick == rows) break;
++                ++taken[pick];
++                ++used;
++                tokens += gain;
++            }
++            if (used > slots) continue; // constrained rows need a wider round than this
++            const double score = tokens / (d.auto_cost + d.row_cost * rows + double(t) * rows);
++            plan[t]            = taken;
++            if (score > best) {
++                best   = score;
++                chosen = t - 1;
++            }
++        }
++        if (best >= 0) {
++            own = plan[chosen + 1];
++            if (chosen + 1 < d.width) {
++                // The columns in use, then spare ones up to one count for every size.
++                std::array<std::int32_t, 17 * kMaximumConcurrency> list{};
++                const auto count = (chosen + 1) * rows;
++                std::uint32_t n  = 0;
++                for (std::uint32_t b = 0; b < rows; ++b)
++                    for (std::uint32_t j = 0; j <= own[b]; ++j)
++                        list[n++] = static_cast<std::int32_t>(b * d.width + j);
++                for (std::uint32_t b = 0; b < rows && n < count; ++b)
++                    for (std::uint32_t j = own[b] + 1; j < d.width && n < count; ++j)
++                        list[n++] = static_cast<std::int32_t>(b * d.width + j);
++                send(d.columns, list.data(), count * sizeof(std::int32_t));
++                compute->compact = chosen + 1;
++            }
++        }
+     }
+     out.clear();
+     for (std::uint32_t b = 0; b < rows; ++b) {
+-        const auto own = std::min(chosen, extents[b]);
+-        lanes[b]->pending_predicted = kept[b][own];
+-        out.emplace_back(ids.begin() + b * k, ids.begin() + b * k + own);
++        lanes[b]->pending_predicted = kept[b][own[b]];
++        out.emplace_back(ids.begin() + b * k, ids.begin() + b * k + own[b]);
+     }
+     ++d.widths[chosen];
+     ++d.proposals;
++    const auto now = std::chrono::steady_clock::now();
++    if (d.last_rows == rows) {
++        const double seconds = std::chrono::duration<double>(now - d.last_round).count();
++        if (seconds < 1) {
++            d.round_seconds[rows] += seconds;
++            ++d.round_count[rows];
++        }
++    }
++    d.last_round = now;
++    d.last_rows  = rows;
+     return true;
+ }
+ 
+diff --git a/src/models/qwen4_exp/program/dflash.h b/src/models/qwen4_exp/program/dflash.h
+index 11f8a43..bb560fc 100644
+--- a/src/models/qwen4_exp/program/dflash.h
++++ b/src/models/qwen4_exp/program/dflash.h
+@@ -13,6 +13,7 @@
+ #include "models/qwen4_exp/execution/dflash.h"
+ 
+ #include <array>
++#include <chrono>
+ #include <optional>
+ #include <vector>
+ 
+@@ -58,10 +59,19 @@ struct DraftRuntime {
+     // Automatic width: a round verifies the draft count with the best expected tokens per cost,
+     // cost = auto_cost + rows * columns (in verify columns; 0 keeps the fixed window).
+     double auto_cost = 0, auto_power = 1;
+-    bool narrow_rows = true; // NINFER_FLASH_DFLASH2_AUTO_ROWS=0 keeps several rows at full width
++    bool narrow_rows = true; // NINFER_FLASH_DFLASH2_AUTO_ROWS=0: several rows verify every draft
++    // Several rows: each row verifies its own draft count. The round's cost is
++    // auto_cost + row_cost * rows + columns in use, in steps of one column per row.
++    double row_cost = 3;
++    Tensor columns; // I32 [width * streams]: the window columns in use, then spare ones
+     double predicted_kept = 0;
+     std::uint64_t kept = 0, drafted = 0;
+     std::array<std::uint64_t, 17> widths{};
++    // Wall time from one proposal to the next, by row count (rounds in a row at that count).
++    std::array<double, kMaximumConcurrency + 1> round_seconds{};
++    std::array<std::uint64_t, kMaximumConcurrency + 1> round_count{};
++    std::chrono::steady_clock::time_point last_round{};
++    std::uint32_t last_rows = 0;
+     // Expected kept drafts of each prefix of one row: out[j] for j drafts, out[0] = 0.
+     void expected(const float* confidence, std::uint32_t extent, double* out) const;
+ };
+diff --git a/src/models/qwen4_exp/program/execution.cpp b/src/models/qwen4_exp/program/execution.cpp
+index 9da0ece..ce77a50 100644
+--- a/src/models/qwen4_exp/program/execution.cpp
++++ b/src/models/qwen4_exp/program/execution.cpp
+@@ -211,10 +211,12 @@ void RankProgramImpl::prepare_main() {
+                                        parallel ? &*parallel : nullptr,
+                                        parallel && !host_ple ? &ple_ready : nullptr};
+     if (draft) execution.draft_features = draft->features;
++    if (draft && f.verify && f.compact)
++        execution.expert_columns =
++            draft->columns.slice(0, 0, static_cast<std::int32_t>(f.compact) * batch);
+     execution::StateUpdate update = execution::StepUpdate{};
+     if (f.verify)
+-        update.emplace<execution::VerifyRecords>(
+-            resources.verify_records(f.tokens, static_cast<std::uint32_t>(batch)));
++        update.emplace<execution::VerifyRecords>(*resources.gdn_records);
+     else if (f.sequence)
+         update = execution::SequenceState{
+             f.rows[0].states.at(parameters.profile->local.rank).source,
+@@ -224,7 +226,7 @@ void RankProgramImpl::prepare_main() {
+         const auto* forward = std::get_if<ForwardWork>(&f.request.work.operation);
+         f.graph             = &graphs->main(batch, f.verify.has_value(), f.visible,
+                                             f.verify || forward->sample != SampleKind::None,
+-                                            f.verify ? f.tokens : 0);
++                                            f.verify ? (f.compact ? f.compact : f.tokens) : 0);
+     }
+     f.layer = 0;
+     if (!f.graph)
+@@ -410,9 +412,7 @@ void RankProgramImpl::prepare_decision() {
+         return;
+     }
+     if (f.verify) {
+-        if (f.narrow)
+-            accept_forward(batch, f.narrow);
+-        else if (graphs && host_ple)
++        if (graphs && host_ple)
+             graphs->accept(batch);
+         else
+             accept_forward(batch);
+diff --git a/src/models/qwen4_exp/program/graphs.cpp b/src/models/qwen4_exp/program/graphs.cpp
+index d7bda67..2356a7a 100644
+--- a/src/models/qwen4_exp/program/graphs.cpp
++++ b/src/models/qwen4_exp/program/graphs.cpp
+@@ -145,7 +145,8 @@ Graphs::Graphs(RankProgramImpl& owner)
+     : owner_(owner), bounds_(decode_context_bounds(owner.shape.max_context)) {}
+ 
+ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
+-                          GraphPreparation& preparation, std::uint32_t width, TextGraph* into) {
++                          GraphPreparation& preparation, std::uint32_t width, TextGraph* into,
++                          std::uint32_t expert_columns) {
+     auto& p             = owner_;
+     auto& r             = p.resources;
+     const auto& buffers = r.plan.persistent.buffers;
+@@ -169,8 +170,11 @@ void Graphs::prepare_main(Batch& graph, std::uint32_t batch, bool verify,
+                                        r.tensor(buffers.ple_records),
+                                        p.parallel ? &*p.parallel : nullptr};
+     if (p.draft) execution.draft_features = p.draft->features;
++    if (expert_columns)
++        execution.expert_columns =
++            p.draft->columns.slice(0, 0, static_cast<std::int32_t>(expert_columns));
+     execution::StateUpdate update = execution::StepUpdate{};
+-    if (verify) update.emplace<execution::VerifyRecords>(r.verify_records(tokens, batch));
++    if (verify) update.emplace<execution::VerifyRecords>(*r.gdn_records);
+     const std::array ple{r.ple_upload->binding(0, tokens, batch),
+                          r.ple_upload->binding(1, tokens, batch)};
+     auto& selected = into ? *into : verify ? graph.verify : graph.main;
+@@ -314,8 +318,13 @@ void Graphs::prepare(GraphInputs& inputs, GraphPreparation& observation) {
+             graph.accept_workspace = r.workspace.peak_used();
+             if (p.draft && p.draft->auto_cost > 0) {
+                 for (std::uint32_t w = 2; w <= p.shape.draft_tokens; ++w) {
+-                    inputs.batch(r.main_batch(w, batch, bounds_.back()), bounds_.back());
+                     graph.narrow.push_back(std::make_unique<TextGraph>());
++                    if (batch > 1) {
++                        prepare_main(graph, batch, true, observation, 0, graph.narrow.back().get(),
++                                     w * batch);
++                        continue;
++                    }
++                    inputs.batch(r.main_batch(w, batch, bounds_.back()), bounds_.back());
+                     prepare_main(graph, batch, true, observation, w, graph.narrow.back().get());
+                 }
+                 // Leave the full window's inputs staged, as the steps after this expect.
+diff --git a/src/models/qwen4_exp/program/graphs.h b/src/models/qwen4_exp/program/graphs.h
+index 526c531..37a4394 100644
+--- a/src/models/qwen4_exp/program/graphs.h
++++ b/src/models/qwen4_exp/program/graphs.h
+@@ -56,7 +56,8 @@ private:
+ 
+     struct Batch {
+         TextGraph main, verify;
+-        // Verify graphs of 2..draft_tokens columns, for automatic width.
++        // Automatic width. One row: verify graphs of 2..draft_tokens columns. Several rows: full
++        // verify graphs whose expert layers run on 2..draft_tokens columns per row.
+         std::vector<std::unique_ptr<TextGraph>> narrow;
+         GraphSegment sample, accept;
+         std::vector<DraftStep> drafts;
+@@ -65,7 +66,8 @@ private:
+     };
+ 
+     void prepare_main(Batch&, std::uint32_t batch, bool verify, GraphPreparation&,
+-                      std::uint32_t width = 0, TextGraph* into = nullptr);
++                      std::uint32_t width = 0, TextGraph* into = nullptr,
++                      std::uint32_t expert_columns = 0);
+     void prepare_drafts(Batch&, std::uint32_t batch, GraphInputs&, GraphPreparation&);
+     RankProgramImpl& owner_;
+     std::vector<std::uint32_t> bounds_;
+diff --git a/src/models/qwen4_exp/program/internal.h b/src/models/qwen4_exp/program/internal.h
+index 8bdca06..c8c95de 100644
+--- a/src/models/qwen4_exp/program/internal.h
++++ b/src/models/qwen4_exp/program/internal.h
+@@ -71,9 +71,9 @@ struct ComputeFrame {
+     std::vector<std::vector<TokenId>> proposed;
+     bool proposal_tried = false;
+     std::array<std::uint32_t, kMaximumConcurrency> own_extents{};
+-    // Several rows of a narrow drafter round: every buffer of the round is laid out for this
+-    // many columns (0 = the full window; one row keeps the full layout, which it is a prefix of).
+-    std::uint32_t narrow = 0;
++    // Several rows with their own draft counts: the expert layers run on this many columns per
++    // row, listed in the drafter's column table (0 = every column).
++    std::uint32_t compact = 0;
+     std::uint32_t tokens = 0, visible = 0, layer = 0;
+     std::uint32_t score_at = 0, score_count = 0;
+     std::vector<float> logprobs;
+@@ -134,8 +134,7 @@ public:
+     void commit_verify(const Commit&);
+     void execute_mtp_commit(std::int32_t batch, bool rebuild_history, bool count_tokens,
+                             DecodeGraphSection*                 = nullptr,
+-                            DecodeGraphSection* captured_counts = nullptr,
+-                            std::uint32_t columns = 0);
++                            DecodeGraphSection* captured_counts = nullptr);
+     [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, std::int32_t batch,
+                                               std::uint32_t visible);
+     void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
+@@ -149,7 +148,7 @@ public:
+     [[nodiscard]] Tensor draft_proposals(std::int32_t batch);
+     [[nodiscard]] Tensor draft_output_ids(std::uint32_t step, std::int32_t batch);
+     void sample_forward(std::int32_t batch, bool first_token);
+-    void accept_forward(std::int32_t batch, std::uint32_t columns = 0);
++    void accept_forward(std::int32_t batch);
+     [[nodiscard]] DistributedVocabulary vocabulary();
+     void vocabulary_sample(std::int32_t batch, bool first_token);
+     void vocabulary_draft(const Tensor& logits, Tensor& ids);
+diff --git a/src/models/qwen4_exp/program/mtp.cpp b/src/models/qwen4_exp/program/mtp.cpp
+index f310e9c..aec5f5a 100644
+--- a/src/models/qwen4_exp/program/mtp.cpp
++++ b/src/models/qwen4_exp/program/mtp.cpp
+@@ -186,17 +186,17 @@ void RankProgramImpl::align_mtp(std::span<const WorkRow> rows, std::uint32_t tok
+     ops::scatter(next, resources.states->conditioning(compute->batch.destination_offsets), cuda);
+ }
+ 
+-void RankProgramImpl::accept_forward(std::int32_t batch, std::uint32_t columns) {
++void RankProgramImpl::accept_forward(std::int32_t batch) {
+     if (parallel) {
+         vocabulary_accept(batch);
+         return;
+     }
+     const auto& buffers   = resources.plan.persistent.buffers;
+     const auto& frame     = *buffers.mtp;
+-    const auto width      = columns ? columns : shape.draft_tokens + 1;
++    const auto width      = shape.draft_tokens + 1;
+     const auto vocabulary = parameters.profile->public_tokens;
+     const auto row = [&](const TensorRegion& r) { return device_tensor(r).slice(0, 0, batch); };
+-    auto drafts    = draft_proposals(batch).slice(0, 0, static_cast<std::int32_t>(width) - 1);
++    auto drafts    = draft_proposals(batch);
+     auto extents   = row(frame.extents);
+     auto device_configs = device_tensor(*buffers.sampling);
+     auto logits =
+@@ -240,15 +240,10 @@ void RankProgramImpl::prepare_mtp() {
+     if (!f.proposed.empty()) {
+         run_tokens = 1;
+         for (int b = 0; b < batch; ++b) run_tokens = std::max(run_tokens, f.own_extents[b] + 1);
+-        const bool constrained = std::any_of(f.rows.begin(), f.rows.end(),
+-                                             [](const auto& row) { return row.constrained; });
+-        if (!(draft->auto_cost > 0) || (batch > 1 && (constrained || !draft->narrow_rows)))
+-            run_tokens = k + 1;
++        // One row runs a narrow forward inside the full layout. Several rows keep the full
++        // window: their own draft counts only limit the columns the expert layers run on.
++        if (!(draft->auto_cost > 0) || batch > 1) run_tokens = k + 1;
+     }
+-    // Several rows lay the whole round out for the narrow window; one row runs the narrow forward
+-    // inside the full layout.
+-    const auto lay = batch > 1 ? run_tokens : k + 1;
+-    f.narrow       = lay != k + 1 ? lay : 0;
+     const auto& chains = work.lookup.empty() ? f.proposed : work.lookup;
+     const bool lookup  = !chains.empty();
+     std::array<ple::InputRow, kMaximumConcurrency> inputs;
+@@ -274,16 +269,16 @@ void RankProgramImpl::prepare_mtp() {
+     }
+     f.verify.emplace();
+     auto& round   = *f.verify;
+-    round.width   = lay;
++    round.width   = width;
+     round.extents = f.proposed.empty() ? std::span<const std::uint32_t>(work.draft_extents)
+                                        : std::span<const std::uint32_t>(f.own_extents.data(), f.rows.size());
+-    f.tokens      = lay;
++    f.tokens      = width;
+     f.sequence    = false;
+-    prepare_main_inputs(f.rows, lay);
++    prepare_main_inputs(f.rows, width);
+     const auto row_tensor = [&](const TensorRegion& region) {
+         return device_tensor(region).slice(0, 0, batch);
+     };
+-    auto drafts      = draft_proposals(batch).slice(0, 0, static_cast<std::int32_t>(lay) - 1);
++    auto drafts      = draft_proposals(batch);
+     const auto steps = k;
+     std::vector<execution::BatchView> calls;
+     calls.reserve(steps);
+@@ -346,7 +341,7 @@ void RankProgramImpl::prepare_mtp() {
+         copy_verify_inputs(batch);
+         prepare_device_ple(f.batch);
+     }
+-    if (run_tokens != lay) {
++    if (run_tokens != width) {
+         f.tokens = run_tokens;
+         f.batch  = resources.main_batch(static_cast<std::int32_t>(run_tokens), batch, f.visible,
+                                         false);
+diff --git a/src/models/qwen4_exp/program/program.cpp b/src/models/qwen4_exp/program/program.cpp
+index d2fa526..085e8bc 100644
+--- a/src/models/qwen4_exp/program/program.cpp
++++ b/src/models/qwen4_exp/program/program.cpp
+@@ -69,6 +69,11 @@ RankProgramImpl::~RankProgramImpl() {
+             if (draft->widths[i])
+                 std::fprintf(stderr, " %zu:%llu", i,
+                              static_cast<unsigned long long>(draft->widths[i]));
++        std::fprintf(stderr, "\nninfer: DFlash2 round ms by rows");
++        for (std::size_t i = 1; i < draft->round_count.size(); ++i)
++            if (draft->round_count[i])
++                std::fprintf(stderr, " %zu:%.1f", i,
++                             1e3 * draft->round_seconds[i] / double(draft->round_count[i]));
+         std::fprintf(stderr, "\n");
+     }
+     graphs.reset();
+diff --git a/src/models/qwen4_exp/program/resources.cpp b/src/models/qwen4_exp/program/resources.cpp
+index 1b47501..009bac7 100644
+--- a/src/models/qwen4_exp/program/resources.cpp
++++ b/src/models/qwen4_exp/program/resources.cpp
+@@ -53,26 +53,6 @@ Resources::Resources(const execution::Parameters& p, ExecutionPlan input, Device
+     if (plan.persistent.buffers.gdn_records) {
+         gdn_records.emplace(backing, *plan.persistent.buffers.gdn_records);
+         gdn_fold.emplace(*gdn_records, states->gdn().all_layers_view({}));
+-        const auto& spec = gdn_records->spec;
+-        const auto outer = spec.layers * spec.record_capacity;
+-        const auto head  = [](const Tensor& plane, std::initializer_list<std::int32_t> shape) {
+-            std::int32_t count = 1;
+-            for (const auto n : shape) count *= n;
+-            return plane.view({static_cast<std::int32_t>(plane.numel())})
+-                .slice(0, 0, count)
+-                .view(shape);
+-        };
+-        gdn_narrow.resize(spec.width);
+-        for (std::int32_t t = 2; t < spec.width; ++t) {
+-            auto narrow       = *gdn_records;
+-            narrow.spec.width = t;
+-            narrow.conv       = head(gdn_records->conv, {spec.conv_channels, t, outer});
+-            narrow.key   = head(gdn_records->key, {spec.key_dim, spec.qk_heads, t, outer});
+-            narrow.value = head(gdn_records->value, {spec.value_dim, spec.value_heads, t, outer});
+-            narrow.gate  = head(gdn_records->gate, {2, spec.value_heads, t, outer});
+-            gdn_narrow[t].emplace(NarrowGdn{
+-                narrow, ops::GdnReplayFoldPlan(narrow, states->gdn().all_layers_view({}))});
+-        }
+     }
+     if (plan.moe) {
+         std::vector<const moe::Parameters*> layers;
+diff --git a/src/models/qwen4_exp/program/resources.h b/src/models/qwen4_exp/program/resources.h
+index 8390063..097e79b 100644
+--- a/src/models/qwen4_exp/program/resources.h
++++ b/src/models/qwen4_exp/program/resources.h
+@@ -71,19 +71,6 @@ public:
+     std::unique_ptr<context::ContextMigration> compute_actions, context_actions;
+     std::optional<GdnReplayRecords> gdn_records;
+     std::optional<ops::GdnReplayFoldPlan> gdn_fold;
+-    // The same record storage laid out for a verify window of fewer columns (index = columns).
+-    // Several rows of a narrow drafter round record and fold through these.
+-    struct NarrowGdn {
+-        GdnReplayRecords records;
+-        ops::GdnReplayFoldPlan fold;
+-    };
+-    std::vector<std::optional<NarrowGdn>> gdn_narrow;
+-    [[nodiscard]] const GdnReplayRecords& verify_records(std::uint32_t columns,
+-                                                         std::uint32_t batch) const {
+-        return batch > 1 && columns < gdn_narrow.size() && gdn_narrow[columns]
+-                   ? gdn_narrow[columns]->records
+-                   : *gdn_records;
+-    }
+     std::unique_ptr<moe::Schedule> experts;
+     std::unique_ptr<ple::UploadSlots> ple_upload;
+     std::unique_ptr<ple::disk::PrepareService> ple_prepare;
+diff --git a/src/ops/flash_dflash/flash_dflash.cu b/src/ops/flash_dflash/flash_dflash.cu
+index d13bf85..3b999bd 100644
+--- a/src/ops/flash_dflash/flash_dflash.cu
++++ b/src/ops/flash_dflash/flash_dflash.cu
+@@ -447,6 +447,27 @@ void selector_confidence(const Tensor& candidates, const Tensor& scores, const T
+     check_launch();
+ }
+ 
++namespace {
++__global__ void gather_columns_kernel(const std::uint16_t* source, const std::int32_t* indices,
++                                      std::uint16_t* out, int d) {
++    const std::uint16_t* from = source + std::int64_t(indices[blockIdx.x]) * d;
++    std::uint16_t* to         = out + std::int64_t(blockIdx.x) * d;
++    for (int i = threadIdx.x; i < d; i += blockDim.x) to[i] = from[i];
++}
++} // namespace
++
++void gather_columns(const Tensor& source, const Tensor& indices, Tensor& out,
++                    CudaExecutionView execution) {
++    const int d = source.ne[0], v = out.ne[1];
++    require(source.dtype == DType::BF16 && out.dtype == DType::BF16 && d > 0 && v > 0 &&
++                out.ne[0] == d && indices.dtype == DType::I32 && indices.numel() >= v,
++            "gather_columns: invalid operands");
++    gather_columns_kernel<<<v, 256, 0, execution.stream()>>>(
++        static_cast<const std::uint16_t*>(source.data),
++        static_cast<const std::int32_t*>(indices.data), static_cast<std::uint16_t*>(out.data), d);
++    check_launch();
++}
++
+ void logits_top16(const Tensor& logits, std::int32_t valid, std::int32_t columns, Tensor& ids,
+                   Tensor& scores, CudaExecutionView execution) {
+     require(logits.dtype == DType::BF16 && valid >= kTop && valid <= logits.ne[0] && columns > 0 &&
+-- 
+2.43.0
+

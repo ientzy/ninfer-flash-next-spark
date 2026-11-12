@@ -1,0 +1,671 @@
+From 61cd4861ad746662058cc7d4bdb3f84e21228d84 Mon Sep 17 00:00:00 2001
+From: ientzy <ientzy@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:07:27 +0200
+Subject: [PATCH 8/9] Flash Next DFlash2: windows up to 15 with copy extension
+
+The verify window may be wider than the 7 drafts of the drafter (up to 15).
+The session sends the tokens that followed an earlier matching stretch of the
+sequence as a copy hint (NINFER_FLASH_DFLASH2_COPY=<match length>), following
+the source across a changed token or two. When the drafts repeat the hint, the
+round goes on with the tokens of the hint after them.
+
+Also: a drafter round no longer projects the unused MTP head, and the top-16
+of the drafter runs in 32 segments per column plus a merge by rank.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ include/ninfer/ops/flash_dflash.h          |  3 +-
+ src/models/qwen4_exp/execution/dflash.cpp  |  3 +-
+ src/models/qwen4_exp/program/dflash.cpp    | 56 ++++++++++-----
+ src/models/qwen4_exp/program/dflash.h      |  8 ++-
+ src/models/qwen4_exp/program/internal.h    |  6 +-
+ src/models/qwen4_exp/program/mtp.cpp       |  8 ++-
+ src/models/qwen4_exp/program/planning.cpp  |  4 +-
+ src/models/qwen4_exp/program/program.cpp   | 23 +++---
+ src/models/qwen4_exp/session/execution.cpp | 81 +++++++++++++++++++---
+ src/models/qwen4_exp/session/internal.h    |  3 +
+ src/models/qwen4_exp/wire.cpp              |  4 ++
+ src/models/qwen4_exp/work.cpp              |  9 +++
+ src/models/qwen4_exp/work.h                |  3 +
+ src/ops/flash_dflash/flash_dflash.cu       | 59 ++++++++++++----
+ src/product/speculative_options.h          |  4 +-
+ 15 files changed, 211 insertions(+), 63 deletions(-)
+
+diff --git a/include/ninfer/ops/flash_dflash.h b/include/ninfer/ops/flash_dflash.h
+index 1889de6..582bf27 100644
+--- a/include/ninfer/ops/flash_dflash.h
++++ b/include/ninfer/ops/flash_dflash.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "core/arena.h"
+ #include "core/device.h"
+ #include "core/tensor.h"
+ 
+@@ -83,6 +84,6 @@ void gather_columns(const Tensor& source, const Tensor& indices, Tensor& out,
+ // The 16 largest of the first `valid` rows of each column of BF16 logits [V,M], descending, ties
+ // to the lower row. ids is I32 [16,M], scores FP32 [16,M] (the logits' values).
+ void logits_top16(const Tensor& logits, std::int32_t valid, std::int32_t columns, Tensor& ids,
+-                  Tensor& scores, CudaExecutionView execution);
++                  Tensor& scores, MemoryArena& workspace, CudaExecutionView execution);
+ 
+ } // namespace ninfer::ops
+diff --git a/src/models/qwen4_exp/execution/dflash.cpp b/src/models/qwen4_exp/execution/dflash.cpp
+index 608f677..b03e42a 100644
+--- a/src/models/qwen4_exp/execution/dflash.cpp
++++ b/src/models/qwen4_exp/execution/dflash.cpp
+@@ -157,7 +157,8 @@ void draft_propose(const Parameters& parameters, MemoryArena& arena, const Draft
+     project_head(hidden, parameters.mtp->head, logits, arena, cuda);
+     auto candidates = call.candidates.view({16, km});
+     auto scores     = call.scores.view({16, km});
+-    ops::logits_top16(logits, dimension(profile.public_tokens), km, candidates, scores, cuda);
++    ops::logits_top16(logits, dimension(profile.public_tokens), km, candidates, scores, arena,
++                      cuda);
+     auto projected = arena.alloc(DType::BF16, {rank, km});
+     project(hidden, p.selector, projected, cuda);
+     auto drafts = call.drafts;
+diff --git a/src/models/qwen4_exp/program/dflash.cpp b/src/models/qwen4_exp/program/dflash.cpp
+index b392a12..6aff24d 100644
+--- a/src/models/qwen4_exp/program/dflash.cpp
++++ b/src/models/qwen4_exp/program/dflash.cpp
+@@ -21,8 +21,9 @@ std::uint32_t minimum_context() {
+ } // namespace
+ 
+ DraftRuntime::DraftRuntime(const execution::Parameters& parameters, Device device,
+-                           std::uint32_t draft_tokens, std::uint32_t streams)
+-    : io_memory(device, kIoBytes), arena_memory(device, kArenaBytes) {
++                           std::uint32_t draft_tokens, std::uint32_t layout_columns,
++                           std::uint32_t streams)
++    : io_memory(device, kIoBytes), arena_memory(device, kArenaBytes), layout(layout_columns) {
+     const auto& config = parameters.profile->config.draft.value();
+     const int h        = dimension(parameters.profile->config.text.hidden);
+     const int taps     = dimension(config.target_layer_ids.size());
+@@ -70,9 +71,9 @@ DraftRuntime::DraftRuntime(const execution::Parameters& parameters, Device devic
+     all.drafts        = io->alloc(DType::I32, {k, n});
+     all.confidence    = io->alloc(DType::FP32, {k, n});
+     positions         = io->alloc(DType::I32, {c});
+-    columns           = io->alloc(DType::I32, {w * n});
++    columns           = io->alloc(DType::I32, {dimension(this->layout) * n});
+     {
+-        std::vector<std::int32_t> identity(static_cast<std::size_t>(w) * n);
++        std::vector<std::int32_t> identity(static_cast<std::size_t>(this->layout) * n);
+         for (std::size_t i = 0; i < identity.size(); ++i) identity[i] = static_cast<std::int32_t>(i);
+         io_memory.copy_from_host(identity.data(), identity.size() * sizeof(std::int32_t),
+                                  static_cast<const char*>(columns.data) -
+@@ -227,11 +228,15 @@ void RankProgramImpl::draft_observe_commit(const Commit& commit) {
+ // to MTP. With automatic width the rows share one window: the width with the best expected tokens
+ // per cost over all rows, cost = auto_cost + rows * columns.
+ bool RankProgramImpl::draft_propose(std::vector<std::vector<TokenId>>& out,
+-                                    std::span<const std::uint32_t> extents) {
++                                    std::span<const std::uint32_t> window,
++                                    std::span<const std::vector<TokenId>> hints) {
+     auto& d         = *draft;
+     const auto& all = compute->rows;
+     const auto rows = static_cast<std::uint32_t>(all.size());
+     std::array<DraftLane*, kMaximumConcurrency> lanes{};
++    // The drafter's own extent of each row; `reach` adds a copy extension below.
++    std::array<std::uint32_t, kMaximumConcurrency> extents{}, reach{};
++    for (std::uint32_t b = 0; b < rows; ++b) extents[b] = std::min(window[b], d.width - 1);
+     for (std::uint32_t b = 0; b < rows; ++b) {
+         const auto& row = all[b];
+         const auto f    = row.main_frontier;
+@@ -283,22 +288,34 @@ bool RankProgramImpl::draft_propose(std::vector<std::vector<TokenId>>& out,
+                 return false;
+             }
+         d.expected(confidence.data() + b * k, extents[b], kept[b].data());
+-        widest = std::max(widest, extents[b]);
++        reach[b] = extents[b];
++        // Drafts that repeat the hint: the row goes on with the hint's tokens after them, each
++        // expected to add a little less than the last draft did.
++        if (b < hints.size() && extents[b] == k && hints[b].size() > k &&
++            std::equal(hints[b].begin(), hints[b].begin() + k, ids.begin() + b * k)) {
++            reach[b]    = std::min<std::uint32_t>(window[b], static_cast<std::uint32_t>(hints[b].size()));
++            double step = kept[b][k] - kept[b][k - 1];
++            for (std::uint32_t j = k + 1; j <= reach[b]; ++j) {
++                step *= 0.97;
++                kept[b][j] = kept[b][j - 1] + step;
++            }
++        }
++        widest = std::max(widest, reach[b]);
+     }
+     std::uint32_t chosen = widest;
+     std::array<std::uint32_t, kMaximumConcurrency> own{};
+-    for (std::uint32_t b = 0; b < rows; ++b) own[b] = extents[b];
++    for (std::uint32_t b = 0; b < rows; ++b) own[b] = reach[b];
+     compute->compact = 0;
+     if (d.auto_cost > 0 && rows == 1) {
+         double best = -1;
+         for (std::uint32_t j = 1; j <= widest; ++j) {
+-            const double score = (1 + kept[0][std::min(j, extents[0])]) / (d.auto_cost + j + 1);
++            const double score = (1 + kept[0][j]) / (d.auto_cost + j + 1);
+             if (score > best) {
+                 best   = score;
+                 chosen = j;
+             }
+         }
+-        own[0] = std::min(chosen, extents[0]);
++        own[0] = chosen;
+     } else if (d.auto_cost > 0 && d.narrow_rows) {
+         // Every row keeps its first draft and a constrained row its whole window. The other
+         // drafts are taken best first, by the tokens each is expected to add, and the round
+@@ -308,17 +325,17 @@ bool RankProgramImpl::draft_propose(std::vector<std::vector<TokenId>>& out,
+         double tokens = rows, best = -1;
+         std::uint32_t used = 0;
+         for (std::uint32_t b = 0; b < rows; ++b) {
+-            taken[b] = all[b].constrained ? extents[b] : 1;
++            taken[b] = all[b].constrained ? reach[b] : 1;
+             tokens += kept[b][taken[b]];
+             used += taken[b];
+         }
+-        for (std::uint32_t t = 2; t <= d.width; ++t) {
++        for (std::uint32_t t = 2; t <= d.layout; ++t) {
+             const auto slots = (t - 1) * rows;
+             while (used < slots) {
+                 std::uint32_t pick = rows;
+                 double gain        = -1;
+                 for (std::uint32_t b = 0; b < rows; ++b) {
+-                    if (taken[b] >= extents[b]) continue;
++                    if (taken[b] >= reach[b]) continue;
+                     const double g = kept[b][taken[b] + 1] - kept[b][taken[b]];
+                     if (g > gain) {
+                         gain = g;
+@@ -340,17 +357,17 @@ bool RankProgramImpl::draft_propose(std::vector<std::vector<TokenId>>& out,
+         }
+         if (best >= 0) {
+             own = plan[chosen + 1];
+-            if (chosen + 1 < d.width) {
++            if (chosen + 1 < d.layout) {
+                 // The columns in use, then spare ones up to one count for every size.
+                 std::array<std::int32_t, 17 * kMaximumConcurrency> list{};
+                 const auto count = (chosen + 1) * rows;
+                 std::uint32_t n  = 0;
+                 for (std::uint32_t b = 0; b < rows; ++b)
+                     for (std::uint32_t j = 0; j <= own[b]; ++j)
+-                        list[n++] = static_cast<std::int32_t>(b * d.width + j);
++                        list[n++] = static_cast<std::int32_t>(b * d.layout + j);
+                 for (std::uint32_t b = 0; b < rows && n < count; ++b)
+-                    for (std::uint32_t j = own[b] + 1; j < d.width && n < count; ++j)
+-                        list[n++] = static_cast<std::int32_t>(b * d.width + j);
++                    for (std::uint32_t j = own[b] + 1; j < d.layout && n < count; ++j)
++                        list[n++] = static_cast<std::int32_t>(b * d.layout + j);
+                 send(d.columns, list.data(), count * sizeof(std::int32_t));
+                 compute->compact = chosen + 1;
+             }
+@@ -359,7 +376,12 @@ bool RankProgramImpl::draft_propose(std::vector<std::vector<TokenId>>& out,
+     out.clear();
+     for (std::uint32_t b = 0; b < rows; ++b) {
+         lanes[b]->pending_predicted = kept[b][own[b]];
+-        out.emplace_back(ids.begin() + b * k, ids.begin() + b * k + own[b]);
++        out.emplace_back(ids.begin() + b * k, ids.begin() + b * k + std::min(own[b], k));
++        if (own[b] > k) {
++            out.back().insert(out.back().end(), hints[b].begin() + k, hints[b].begin() + own[b]);
++            ++d.extended;
++            d.extended_tokens += own[b] - k;
++        }
+     }
+     ++d.widths[chosen];
+     ++d.proposals;
+diff --git a/src/models/qwen4_exp/program/dflash.h b/src/models/qwen4_exp/program/dflash.h
+index bb560fc..877ab76 100644
+--- a/src/models/qwen4_exp/program/dflash.h
++++ b/src/models/qwen4_exp/program/dflash.h
+@@ -29,8 +29,9 @@ struct DraftLane {
+ };
+ 
+ struct DraftRuntime {
++    // `draft_tokens` is the drafter's own count; `layout` the columns of a verify window.
+     DraftRuntime(const execution::Parameters&, Device, std::uint32_t draft_tokens,
+-                 std::uint32_t streams);
++                 std::uint32_t layout, std::uint32_t streams);
+ 
+     [[nodiscard]] DraftLane* find(std::uint64_t sequence, std::uint64_t generation);
+     [[nodiscard]] DraftLane& acquire(std::uint64_t sequence, std::uint64_t generation);
+@@ -63,7 +64,10 @@ struct DraftRuntime {
+     // Several rows: each row verifies its own draft count. The round's cost is
+     // auto_cost + row_cost * rows + columns in use, in steps of one column per row.
+     double row_cost = 3;
+-    Tensor columns; // I32 [width * streams]: the window columns in use, then spare ones
++    Tensor columns; // I32 [layout * streams]: the window columns in use, then spare ones
++    std::uint32_t layout = 0;
++    // Rounds whose drafts repeated the copy hint and went on with it, and the tokens added.
++    std::uint64_t extended = 0, extended_tokens = 0;
+     double predicted_kept = 0;
+     std::uint64_t kept = 0, drafted = 0;
+     std::array<std::uint64_t, 17> widths{};
+diff --git a/src/models/qwen4_exp/program/internal.h b/src/models/qwen4_exp/program/internal.h
+index c8c95de..9404c4c 100644
+--- a/src/models/qwen4_exp/program/internal.h
++++ b/src/models/qwen4_exp/program/internal.h
+@@ -138,13 +138,15 @@ public:
+     [[nodiscard]] execution::MtpRun draft_run(std::uint32_t step, std::int32_t batch,
+                                               std::uint32_t visible);
+     void draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
+-                       const DecodeGraphDefinition* = nullptr, DecodeGraphChild* = nullptr);
++                       const DecodeGraphDefinition* = nullptr, DecodeGraphChild* = nullptr,
++                       bool head = true);
+     void install_decode(std::int32_t batch);
+     void draft_append(DraftLane&, std::uint32_t column, std::uint32_t first, std::uint32_t count);
+     void draft_observe_forward();
+     void draft_observe_commit(const Commit&);
+     [[nodiscard]] bool draft_propose(std::vector<std::vector<TokenId>>&,
+-                                     std::span<const std::uint32_t> extents);
++                                     std::span<const std::uint32_t> extents,
++                                     std::span<const std::vector<TokenId>> hints);
+     [[nodiscard]] Tensor draft_proposals(std::int32_t batch);
+     [[nodiscard]] Tensor draft_output_ids(std::uint32_t step, std::int32_t batch);
+     void sample_forward(std::int32_t batch, bool first_token);
+diff --git a/src/models/qwen4_exp/program/mtp.cpp b/src/models/qwen4_exp/program/mtp.cpp
+index aec5f5a..cf267a5 100644
+--- a/src/models/qwen4_exp/program/mtp.cpp
++++ b/src/models/qwen4_exp/program/mtp.cpp
+@@ -90,7 +90,8 @@ execution::MtpRun RankProgramImpl::draft_run(std::uint32_t step, std::int32_t ba
+ }
+ 
+ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std::uint32_t visible,
+-                                    const DecodeGraphDefinition* mixer, DecodeGraphChild* child) {
++                                    const DecodeGraphDefinition* mixer, DecodeGraphChild* child,
++                                    bool head) {
+     const auto& buffers = resources.plan.persistent.buffers;
+     const auto& frame   = *buffers.mtp;
+     const auto channels = dimension(parameters.profile->config.text.residual_width());
+@@ -109,6 +110,7 @@ void RankProgramImpl::draft_forward(std::uint32_t step, std::int32_t batch, std:
+         run.feed_forward();
+         run.finish({sample, next});
+     }
++    if (!head) return; // the caller supplies this step's token
+     auto logits =
+         packed_tensor(*buffers.logits, {dimension(parameters.profile->local.vocabulary), batch});
+     execution::project_head(sample, parameters.mtp->head, logits, resources.workspace, cuda);
+@@ -228,7 +230,7 @@ void RankProgramImpl::prepare_mtp() {
+     // A DFlash2 round rides the lookup path: the drafter's tokens are known before the verify.
+     if (draft && work.lookup.empty() && host_ple && !device_graphs && !f.proposal_tried) {
+         f.proposal_tried = true;
+-        if (draft_propose(f.proposed, work.draft_extents)) {
++        if (draft_propose(f.proposed, work.draft_extents, work.hint)) {
+             for (int b = 0; b < batch; ++b)
+                 f.own_extents[b] = static_cast<std::uint32_t>(f.proposed[b].size());
+         } else {
+@@ -304,7 +306,7 @@ void RankProgramImpl::prepare_mtp() {
+         const nvtx::ScopedRange range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp);
+         if (lookup) {
+             // Step 0 still runs: the commit takes the MTP tail it leaves in working slot 0.
+-            draft_forward(0, batch, calls[0].max_visible_tokens);
++            draft_forward(0, batch, calls[0].max_visible_tokens, nullptr, nullptr, false);
+             for (std::uint32_t step = 0; step < steps; ++step) {
+                 auto ids = draft_output_ids(step, batch);
+                 std::array<std::int32_t, kMaximumConcurrency> values{};
+diff --git a/src/models/qwen4_exp/program/planning.cpp b/src/models/qwen4_exp/program/planning.cpp
+index c4def99..b1ca0fb 100644
+--- a/src/models/qwen4_exp/program/planning.cpp
++++ b/src/models/qwen4_exp/program/planning.cpp
+@@ -63,8 +63,8 @@ EngineOptions options(const execution::ModelProfile& profile, const EngineOption
+         if (o.speculative.draft_tokens || o.speculative.proposal_head != ProposalHead::Full)
+             throw std::invalid_argument("disabled MTP requires zero drafts and the full head");
+     } else if (o.speculative.backend != SpeculativeBackend::Mtp || !o.speculative.draft_tokens ||
+-               o.speculative.draft_tokens > 10)
+-        throw std::invalid_argument("Qwen4Exp MTP draft count must be in [1,10]");
++               o.speculative.draft_tokens > 15)
++        throw std::invalid_argument("Qwen4Exp MTP draft count must be in [1,15]");
+     if (o.purpose == EnginePurpose::CausalScoring &&
+         (o.max_concurrency != 1 || o.enable_vision ||
+          o.speculative.backend != SpeculativeBackend::None))
+diff --git a/src/models/qwen4_exp/program/program.cpp b/src/models/qwen4_exp/program/program.cpp
+index 085e8bc..f323bc8 100644
+--- a/src/models/qwen4_exp/program/program.cpp
++++ b/src/models/qwen4_exp/program/program.cpp
+@@ -38,17 +38,19 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& p, ExecutionPlan p
+     if (resources.ple_prepare) host_ple = std::make_unique<PlePipeline>(resources, d);
+     if (parameters.draft) {
+         const auto block = parameters.profile->config.draft->training_block_size.value_or(8);
+-        if (!host_ple || parallel || !shape.draft_tokens ||
+-            shape.draft_tokens + 1 > block)
++        if (!host_ple || parallel || !shape.draft_tokens)
+             std::fprintf(stderr,
+-                         "ninfer: DFlash2 drafter left off (needs Host PLE, one lane and 1..%u "
+-                         "draft tokens)\n",
+-                         block - 1);
++                         "ninfer: DFlash2 drafter left off (needs Host PLE, one lane and draft "
++                         "tokens)\n");
+         else {
+-            draft = std::make_unique<DraftRuntime>(parameters, cuda.device(), shape.draft_tokens,
+-                                                   shape.max_concurrency);
+-            std::fprintf(stderr, "ninfer: DFlash2 drafter on, %u draft tokens, width %s\n",
+-                         shape.draft_tokens, draft->auto_cost > 0 ? "automatic" : "fixed");
++            draft = std::make_unique<DraftRuntime>(parameters, cuda.device(),
++                                                   std::min<std::uint32_t>(shape.draft_tokens,
++                                                                           block - 1),
++                                                   shape.draft_tokens + 1, shape.max_concurrency);
++            std::fprintf(stderr,
++                         "ninfer: DFlash2 drafter on, %u draft tokens in a window of %u, width %s\n",
++                         draft->width - 1, shape.draft_tokens,
++                         draft->auto_cost > 0 ? "automatic" : "fixed");
+         }
+     }
+ }
+@@ -69,6 +71,9 @@ RankProgramImpl::~RankProgramImpl() {
+             if (draft->widths[i])
+                 std::fprintf(stderr, " %zu:%llu", i,
+                              static_cast<unsigned long long>(draft->widths[i]));
++        std::fprintf(stderr, "\nninfer: DFlash2 copy extensions %llu, tokens %llu",
++                     static_cast<unsigned long long>(draft->extended),
++                     static_cast<unsigned long long>(draft->extended_tokens));
+         std::fprintf(stderr, "\nninfer: DFlash2 round ms by rows");
+         for (std::size_t i = 1; i < draft->round_count.size(); ++i)
+             if (draft->round_count[i])
+diff --git a/src/models/qwen4_exp/session/execution.cpp b/src/models/qwen4_exp/session/execution.cpp
+index ebafbb4..32f4478 100644
+--- a/src/models/qwen4_exp/session/execution.cpp
++++ b/src/models/qwen4_exp/session/execution.cpp
+@@ -19,17 +19,28 @@ std::uint32_t lookup_suffix() {
+     return value;
+ }
+ 
+-// The `want` tokens that followed the earlier occurrence sharing the longest run of tokens with the
+-// end of the sequence (at least `suffix`; the latest one among equals). Empty when there is none or
+-// fewer than `want` tokens follow it.
+-std::vector<TokenId> lookup_chain(std::span<const TokenId> tokens, std::uint32_t want,
+-                                  std::uint32_t suffix) {
++// NINFER_FLASH_DFLASH2_COPY=<suffix length, at least 2> sends a copy hint with drafter rounds.
++std::uint32_t hint_suffix() {
++    static const std::uint32_t value = [] {
++        const char* on   = std::getenv("NINFER_FLASH_DFLASH2");
++        const char* text = std::getenv("NINFER_FLASH_DFLASH2_COPY");
++        const auto n     = on && text ? std::strtoul(text, nullptr, 10) : 0UL;
++        return n >= 2 && n <= 64 ? static_cast<std::uint32_t>(n) : 0U;
++    }();
++    return value;
++}
++
++// Where the end of the sequence is being copied from: the index just after the earlier occurrence
++// sharing the longest run of tokens with the end of the sequence (at least `suffix`; the latest
++// one among equals) that has at least `least` tokens after it. 0 when there is none.
++std::size_t lookup_position(std::span<const TokenId> tokens, std::size_t least,
++                            std::uint32_t suffix) {
+     constexpr std::size_t kLongest = 48;
+     const auto n = tokens.size();
+-    if (!want || !suffix || n < suffix + want + 1) return {};
++    if (!least || !suffix || n < suffix + least + 1) return 0;
+     const auto* tail = tokens.data() + n - suffix;
+     std::size_t best = 0, best_end = 0;
+-    for (std::size_t end = n - want; end >= suffix; --end) {
++    for (std::size_t end = n - least; end >= suffix; --end) {
+         if (tokens[end - 1] != tokens[n - 1]) continue;
+         if (!std::equal(tail, tail + suffix, tokens.data() + end - suffix)) continue;
+         std::size_t run = suffix;
+@@ -40,8 +51,47 @@ std::vector<TokenId> lookup_chain(std::span<const TokenId> tokens, std::uint32_t
+             if (run == kLongest) break;
+         }
+     }
+-    if (!best) return {};
+-    return {tokens.begin() + best_end, tokens.begin() + best_end + want};
++    return best_end;
++}
++
++// The `want` tokens after lookup_position. Empty when there is none or fewer than `want` follow.
++std::vector<TokenId> lookup_chain(std::span<const TokenId> tokens, std::uint32_t want,
++                                  std::uint32_t suffix) {
++    const auto at = lookup_position(tokens, want, suffix);
++    if (!at) return {};
++    return {tokens.begin() + at, tokens.begin() + at + want};
++}
++
++// The copy hint of a sequence: up to `want` tokens from where its newest tokens are being copied.
++// That is lookup_position. Without one, a copy that changed a token or two (a rename) is still
++// followed from where the last hint stood, the changed stretch allowed to be up to two tokens
++// shorter or longer, while 12 of the newest 16 tokens agree with the source.
++std::vector<TokenId> copy_hint(detail::Sequence& s, std::uint32_t want, std::uint32_t suffix) {
++    constexpr std::size_t kSpan = 16, kAgree = 12;
++    const std::span<const TokenId> tokens(s.identity.tokens);
++    const auto n = tokens.size();
++    auto at      = lookup_position(tokens, 1, suffix);
++    if (!at && s.copy_source && s.copy_at && s.copy_at < n) {
++        const auto expect = static_cast<std::int64_t>(s.copy_source + (n - s.copy_at));
++        std::size_t best  = 0;
++        for (const std::int64_t shift : {0, 1, -1, 2, -2}) {
++            const auto end = expect + shift;
++            if (end < static_cast<std::int64_t>(kSpan) || end >= static_cast<std::int64_t>(n))
++                continue;
++            std::size_t same = 0;
++            for (std::size_t i = 1; i <= kSpan; ++i)
++                same += tokens[static_cast<std::size_t>(end) - i] == tokens[n - i];
++            if (same > best) {
++                best = same;
++                at   = static_cast<std::size_t>(end);
++            }
++        }
++        if (best < kAgree) at = 0;
++    }
++    s.copy_source = at;
++    s.copy_at     = at ? n : 0;
++    if (!at) return {};
++    return {tokens.begin() + at, tokens.begin() + at + std::min<std::size_t>(want, n - at)};
+ }
+ 
+ void submit(detail::SessionImpl& session, runtime::ExecutionReservation reservation, Work work) {
+@@ -178,6 +228,17 @@ Session::start_decode(std::span<const SequenceHandle> members,
+             s.lookup_accepted = s.speculative.accepted_tokens;
+         }
+     }
++    std::vector<std::vector<TokenId>> hint;
++    if (speculative && lookup.empty() && hint_suffix()) {
++        bool any = false;
++        hint.resize(members.size());
++        for (std::size_t b = 0; b < members.size(); ++b) {
++            if (extents[b] < 2) continue;
++            hint[b] = copy_hint(p.sequence(members[b]), extents[b], hint_suffix());
++            any |= !hint[b].empty();
++        }
++        if (!any) hint.clear();
++    }
+     auto reservation = p.executor->try_reserve(runtime::FrameKind::Compute);
+     if (!reservation) return {};
+     p.compute = std::make_unique<detail::ComputeTransaction>(
+@@ -198,7 +259,7 @@ Session::start_decode(std::span<const SequenceHandle> members,
+         }
+         Work work;
+         if (speculative)
+-            work.operation = MtpWork{tx.rows, tx.extents, std::move(lookup)};
++            work.operation = MtpWork{tx.rows, tx.extents, std::move(lookup), std::move(hint)};
+         else
+             work.operation = ForwardWork{ForwardKind::Ordinary, SampleKind::NextToken, tx.rows, {}};
+         submit(p, std::move(*reservation), std::move(work));
+diff --git a/src/models/qwen4_exp/session/internal.h b/src/models/qwen4_exp/session/internal.h
+index b262942..9b72613 100644
+--- a/src/models/qwen4_exp/session/internal.h
++++ b/src/models/qwen4_exp/session/internal.h
+@@ -101,6 +101,9 @@ struct Sequence {
+     std::uint64_t lookup_drafted = 0, lookup_accepted = 0;
+     std::uint32_t lookup_cooldown = 0;
+     bool lookup_last              = false;
++    // Copy hint: where the last hint started in the sequence's tokens, and the sequence's length
++    // then (0 = none).
++    std::size_t copy_source = 0, copy_at = 0;
+ };
+ 
+ struct Suspended {
+diff --git a/src/models/qwen4_exp/wire.cpp b/src/models/qwen4_exp/wire.cpp
+index 63717f5..79337b7 100644
+--- a/src/models/qwen4_exp/wire.cpp
++++ b/src/models/qwen4_exp/wire.cpp
+@@ -187,6 +187,8 @@ void encode_work(Encoder& out, const Work& work, const VisionInputBindings& inpu
+                 integers(out, v.draft_extents);
+                 out.u64(v.lookup.size());
+                 for (const auto& row : v.lookup) integers(out, row);
++                out.u64(v.hint.size());
++                for (const auto& row : v.hint) integers(out, row);
+             } else if constexpr (std::is_same_v<T, ContextWork>) {
+                 out.u8(3);
+                 out.u64(v.bindings.size());
+@@ -235,6 +237,8 @@ Work decode_work(Decoder& in, const VisionInputBindings& inputs) {
+         MtpWork v{rows(in, rank), integers<std::uint32_t>(in), {}};
+         v.lookup.resize(in.u64());
+         for (auto& row : v.lookup) row = integers<TokenId>(in);
++        v.hint.resize(in.u64());
++        for (auto& row : v.hint) row = integers<TokenId>(in);
+         work.operation = std::move(v);
+         break;
+     }
+diff --git a/src/models/qwen4_exp/work.cpp b/src/models/qwen4_exp/work.cpp
+index 385124e..56d1d0b 100644
+--- a/src/models/qwen4_exp/work.cpp
++++ b/src/models/qwen4_exp/work.cpp
+@@ -234,6 +234,15 @@ void WorkContract::validate(const Work& work, runtime::FrameKind kind) const {
+                         tokens(operation.lookup[i], public_tokens);
+                     }
+                 }
++                if (!operation.hint.empty()) {
++                    if (operation.hint.size() != rows.size())
++                        throw std::invalid_argument("invalid Qwen4Exp copy-hint rows");
++                    for (std::size_t i = 0; i < rows.size(); ++i) {
++                        if (operation.hint[i].size() > operation.draft_extents[i])
++                            throw std::invalid_argument("invalid Qwen4Exp copy-hint extent");
++                        tokens(operation.hint[i], public_tokens);
++                    }
++                }
+             } else if constexpr (std::is_same_v<T, ScoreWork>) {
+                 if (shape.purpose != EnginePurpose::CausalScoring || operation.row.ids.empty() ||
+                     operation.row.ids.size() > shape.prefill_chunk ||
+diff --git a/src/models/qwen4_exp/work.h b/src/models/qwen4_exp/work.h
+index 83c3407..661266a 100644
+--- a/src/models/qwen4_exp/work.h
++++ b/src/models/qwen4_exp/work.h
+@@ -72,6 +72,9 @@ struct MtpWork {
+     // Prompt lookup: empty, or one row per member holding exactly draft_extents[row] tokens copied
+     // from the sequence's own history. A lookup round verifies these instead of MTP proposals.
+     std::vector<std::vector<TokenId>> lookup;
++    // Copy hint for drafter rounds: empty, or one row per member holding up to draft_extents[row]
++    // tokens that followed an earlier matching stretch of the sequence (a row may be empty).
++    std::vector<std::vector<TokenId>> hint;
+ };
+ 
+ struct ResidencyBinding {
+diff --git a/src/ops/flash_dflash/flash_dflash.cu b/src/ops/flash_dflash/flash_dflash.cu
+index 3b999bd..8a43114 100644
+--- a/src/ops/flash_dflash/flash_dflash.cu
++++ b/src/ops/flash_dflash/flash_dflash.cu
+@@ -236,25 +236,30 @@ __global__ void selector_confidence_kernel(const std::int32_t* candidates, const
+     out[i] = chosen / total;
+ }
+ 
+-constexpr int kTop = 16, kTopThreads = 1024;
++constexpr int kTop = 16, kTopThreads = 256, kTopSegments = 32;
+ 
+ __device__ inline bool better(float a, int ia, float b, int ib) {
+     return a > b || (a == b && ia < ib);
+ }
+ 
+-// One block per column. Each thread keeps the sorted top 16 of its strided rows, then the block
+-// takes the best remaining head 16 times.
+-__global__ void top16_kernel(const bf16* logits, std::int64_t column_stride, int valid,
+-                             std::int32_t* ids, float* scores) {
++// One block per segment of a column (kTopSegments each). Each thread keeps the sorted top 16 of
++// its strided rows, then the block takes the best remaining head 16 times. Writes the segment's
++// candidates [16, kTopSegments, M]; a short segment pads with (-inf, INT_MAX).
++__global__ void top16_segment_kernel(const bf16* logits, std::int64_t column_stride, int valid,
++                                     std::int32_t* ids, float* scores) {
+     __shared__ float head_value[kTopThreads];
+     __shared__ int head_id[kTopThreads];
+     __shared__ int winner;
+-    const int column  = blockIdx.x, t = threadIdx.x;
++    const int column = blockIdx.x / kTopSegments, segment = blockIdx.x % kTopSegments;
++    const int t      = threadIdx.x;
++    const int length = (valid + kTopSegments - 1) / kTopSegments;
++    const int begin  = segment * length;
++    const int end    = min(valid, begin + length);
+     const bf16* source = logits + std::int64_t(column) * column_stride;
+     float values[kTop];
+     int rows[kTop];
+     int count = 0;
+-    for (int r = t; r < valid; r += kTopThreads) {
++    for (int r = begin + t; r < end; r += kTopThreads) {
+         const float v = __bfloat162float(source[r]);
+         if (count == kTop && !better(v, r, values[kTop - 1], rows[kTop - 1])) continue;
+         int j = count < kTop ? count++ : kTop - 1;
+@@ -270,14 +275,13 @@ __global__ void top16_kernel(const bf16* logits, std::int64_t column_stride, int
+         head_value[t] = next < count ? values[next] : -INFINITY;
+         head_id[t]    = next < count ? rows[next] : INT_MAX;
+         __syncthreads();
+-        // Tree reduction over the block's heads; thread 0 ends with the winner's thread index.
+         if (t == 0) {
+             int best = 0;
+             for (int i = 1; i < kTopThreads; ++i)
+                 if (better(head_value[i], head_id[i], head_value[best], head_id[best])) best = i;
+-            winner                 = best;
+-            ids[column * kTop + rank]    = head_id[best];
+-            scores[column * kTop + rank] = head_value[best];
++            winner                          = best;
++            ids[blockIdx.x * kTop + rank]    = head_id[best];
++            scores[blockIdx.x * kTop + rank] = head_value[best];
+         }
+         __syncthreads();
+         if (winner == t) ++next;
+@@ -285,6 +289,24 @@ __global__ void top16_kernel(const bf16* logits, std::int64_t column_stride, int
+     }
+ }
+ 
++// One block per column, one thread per candidate: a candidate's rank is the number of better
++// ones, and the first 16 ranks are the result.
++__global__ void top16_merge_kernel(const std::int32_t* candidate_ids,
++                                   const float* candidate_scores, std::int32_t* ids,
++                                   float* scores) {
++    constexpr int n          = kTop * kTopSegments;
++    const std::int32_t* from = candidate_ids + blockIdx.x * n;
++    const float* values      = candidate_scores + blockIdx.x * n;
++    const float v            = values[threadIdx.x];
++    const int id             = from[threadIdx.x];
++    int rank                 = 0;
++    for (int j = 0; j < n; ++j) rank += better(values[j], from[j], v, id) ? 1 : 0;
++    if (rank < kTop) {
++        ids[blockIdx.x * kTop + rank]    = id;
++        scores[blockIdx.x * kTop + rank] = v;
++    }
++}
++
+ } // namespace
+ 
+ void hc_stream_mean(const Tensor& residual, std::int32_t first, std::int32_t count,
+@@ -469,14 +491,23 @@ void gather_columns(const Tensor& source, const Tensor& indices, Tensor& out,
+ }
+ 
+ void logits_top16(const Tensor& logits, std::int32_t valid, std::int32_t columns, Tensor& ids,
+-                  Tensor& scores, CudaExecutionView execution) {
++                  Tensor& scores, MemoryArena& workspace, CudaExecutionView execution) {
+     require(logits.dtype == DType::BF16 && valid >= kTop && valid <= logits.ne[0] && columns > 0 &&
+                 ids.ne[0] == kTop && scores.ne[0] == kTop && ids.dtype == DType::I32 &&
+                 scores.dtype == DType::FP32,
+             "logits_top16: invalid operands");
+-    top16_kernel<<<columns, kTopThreads, 0, execution.stream()>>>(
++    auto scope            = workspace.scope();
++    auto candidate_ids    = workspace.alloc(DType::I32, {kTop * kTopSegments, columns});
++    auto candidate_scores = workspace.alloc(DType::FP32, {kTop * kTopSegments, columns});
++    top16_segment_kernel<<<columns * kTopSegments, kTopThreads, 0, execution.stream()>>>(
+         static_cast<const bf16*>(logits.data), logits.ne[0], valid,
+-        static_cast<std::int32_t*>(ids.data), static_cast<float*>(scores.data));
++        static_cast<std::int32_t*>(candidate_ids.data),
++        static_cast<float*>(candidate_scores.data));
++    check_launch();
++    top16_merge_kernel<<<columns, kTop * kTopSegments, 0, execution.stream()>>>(
++        static_cast<const std::int32_t*>(candidate_ids.data),
++        static_cast<const float*>(candidate_scores.data), static_cast<std::int32_t*>(ids.data),
++        static_cast<float*>(scores.data));
+     check_launch();
+ }
+ 
+diff --git a/src/product/speculative_options.h b/src/product/speculative_options.h
+index d2adc84..efd0f04 100644
+--- a/src/product/speculative_options.h
++++ b/src/product/speculative_options.h
+@@ -39,8 +39,8 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options)
+         }
+         return;
+     case SpeculativeBackend::Mtp:
+-        if (options.draft_tokens == 0 || options.draft_tokens > 10) {
+-            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,10]");
++        if (options.draft_tokens == 0 || options.draft_tokens > 15) {
++            throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,15]");
+         }
+         return;
+     case SpeculativeBackend::DFlash:
+-- 
+2.43.0
+

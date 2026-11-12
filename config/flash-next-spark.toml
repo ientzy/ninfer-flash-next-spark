@@ -1,0 +1,28 @@
+# Qwen3.8 Flash Next with the DFlash2 drafter on a DGX Spark.
+# scripts/get-model.sh copies this to config/local.toml with the model path filled in.
+
+[model]
+path = "/path/to/models/flash-next-dflash2-q8/qwen3_8_flash_next.ninfer"
+vision = true
+
+[engine]
+max_context = 262144   # per request; the shared store is sized by --context-capacity
+max_concurrency = 8    # streams served at once (1..8)
+kv_dtype = "fp8"
+context_capacity = "auto"   # scripts/serve.sh passes --context-capacity 12GiB
+prefill_chunk = 4096
+cuda_graph = true
+
+[speculative]
+backend = "mtp"             # the drafter replaces MTP rounds when NINFER_FLASH_DFLASH2=1
+draft_tokens = 15           # verify window: 7 drafts from the drafter, up to 15 with copy extension
+proposal_head = "optimized"
+
+[vision]
+memory_budget = "1GiB"
+
+[server]
+host = "127.0.0.1"          # 0.0.0.0 for access from the network
+port = 8080
+model_id = "qwen3.8-flash-next"
+# api_key = "replace-with-your-key"
